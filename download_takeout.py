@@ -214,6 +214,27 @@ class MoveWorker:
         self._queue.put(None)
         self._thread.join()
 
+# Heuristic only — Google doesn't publish how long a `rapt` token stays
+# valid. This just makes a stale capture visible up front (e.g. when
+# resuming a run much later) instead of only discovered after a failed
+# download makes the script pause anyway.
+CURL_STALENESS_WARNING_SECONDS = 10 * 60
+
+def describe_curl_age():
+    """Print curl.txt's age, warning if it looks old enough to be stale."""
+    try:
+        age_seconds = time.time() - os.path.getmtime('curl.txt')
+    except OSError:
+        return
+
+    print(f"Using curl.txt captured {age_seconds / 60:.0f} minute(s) ago.")
+    if age_seconds > CURL_STALENESS_WARNING_SECONDS:
+        print(
+            f"Warning: that's over {CURL_STALENESS_WARNING_SECONDS // 60} "
+            "minutes old — the session may already be stale. Consider "
+            "recapturing curl.txt now rather than waiting for a failure."
+        )
+
 def load_curl_state(session):
     """
     Read curl.txt, parse it, and apply its headers/cookies to `session`
@@ -243,7 +264,12 @@ def main():
         return 1
 
     # Read curl command
-    if not os.path.exists('curl.txt'):
+    if os.path.exists('curl.txt'):
+        # Only worth flagging for a pre-existing capture (e.g. resuming a
+        # run started earlier) — one just freshly written by
+        # refresh_download_token() below is obviously not stale.
+        describe_curl_age()
+    else:
         logging.error("curl.txt not found. Attempting to retrieve new token.")
         if not refresh_download_token():
             logging.error("Failed to retrieve new download token")
