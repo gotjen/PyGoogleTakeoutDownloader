@@ -43,3 +43,4 @@ secrets.json
 
 # Path: .gitignore
 curl.txt
+temp_download/

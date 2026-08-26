@@ -10,7 +10,7 @@ split across many numbered zip files. Google Takeout requires a fresh,
 short-lived authenticated download URL, and the session backing it expires
 periodically.
 
-Workflow (see Readme.md's "Workflow" section for the full walkthrough):
+Workflow (see README.md's "Workflow" section for the full walkthrough):
 
 1. `configure_secrets.py` sets up `secrets.json` (output directory, file
    count, download delay).
@@ -19,11 +19,21 @@ Workflow (see Readme.md's "Workflow" section for the full walkthrough):
    Takeout download request). There is no automated login step — see
    "Why capture is manual" below.
 3. `download_takeout.py` replays that captured request with an incrementing
-   file index (`requests`), downloading each Takeout zip, verifying size
-   against `Content-Length`, and persisting
+   file index (`requests`), streaming each Takeout zip into the local,
+   gitignored `temp_download/` directory (inside the repo) first, verifying
+   size against `Content-Length`, then `shutil.move`-ing the verified file
+   into the configured `output_directory` and persisting
    `authentication.last_downloaded_index` in `secrets.json` so re-running
-   resumes automatically. It takes **no command-line arguments** — everything
-   comes from `secrets.json`/`curl.txt`.
+   resumes automatically. It takes **no command-line arguments** —
+   everything comes from `secrets.json`/`curl.txt`.
+   - **Why stage locally first:** `output_directory` is commonly a
+     network/cloud-mounted destination (e.g. an `rclone` remote), which can
+     throw transient `OSError`s under a sustained many-GB write. Downloading
+     to local disk first means that failure mode only ever costs a retry of
+     the (cheap) move, never a re-download of the (expensive,
+     token-consuming) file from Google. A completed `temp_download/*.part`
+     file matching the expected size is detected and reused on the next run
+     instead of re-downloading.
 4. When the session goes stale (missing/unparseable `curl.txt`, or a
    non-200/HTML response mid-download), `download_takeout.py` pauses, prints
    the manual-recapture steps, and blocks on `input()` until the user
@@ -153,17 +163,23 @@ this up.
   the 500 above) usually explain themselves in the body far better than the
   status code alone.
 - **An `OSError` writing the output file crashed the whole run instead of
-  failing just that file.** Confirmed in practice: `output_directory` can be
-  (and in this environment is) an `rclone`/FUSE-mounted remote — streaming a
-  many-GB file through that continuously is exactly where a transient backend
-  hiccup surfaces as a plain `OSError: [Errno 5] Input/output error`, which
-  wasn't caught anywhere (only `requests.Timeout`/`requests.RequestException`
-  were). Worse, the cleanup `tmpfile.unlink()` calls weren't defensive
-  either, so a failing cleanup on the same flaky mount could itself raise and
-  obscure the original error. Fixed: a dedicated `except OSError` around the
-  per-file write/verify/rename block prints a clear disk/mount-specific
-  message and returns cleanly (re-running resumes at the same index, since
-  `last_downloaded_index` is only advanced after success); added
-  `_safe_unlink()` so cleanup failures are logged, not raised. Also bumped
-  `iter_content`'s chunk size from 8 KiB to 4 MiB — at 8 KiB a single
-  50+ GB file is millions of Python-level iterations for no benefit.
+  failing just that file.** `output_directory` can be a network/cloud-mounted
+  remote (e.g. `rclone`) — streaming a many-GB file through that continuously
+  is exactly where a transient backend hiccup surfaces as a plain
+  `OSError: [Errno 5] Input/output error`, which wasn't caught anywhere (only
+  `requests.Timeout`/`requests.RequestException` were). Worse, the cleanup
+  `tmpfile.unlink()` calls weren't defensive either, so a failing cleanup on
+  the same flaky mount could itself raise and obscure the original error.
+  Fixed: a dedicated `except OSError` around the per-file write/verify/rename
+  block prints a clear disk/mount-specific message and returns cleanly
+  (re-running resumes at the same index, since `last_downloaded_index` is
+  only advanced after success); added `_safe_unlink()` so cleanup failures
+  are logged, not raised. Also bumped `iter_content`'s chunk size from 8 KiB
+  to 4 MiB — at 8 KiB a single 50+ GB file is millions of Python-level
+  iterations for no benefit.
+- **Downloads now stage in a local `temp_download/` directory before moving
+  to `output_directory`**, so the slow/expensive part (streaming from
+  Google) never touches a remote-mounted destination directly — only the
+  final `shutil.move()` does, which is cheap to retry without re-downloading
+  if the destination hiccups. A completed local file matching the expected
+  size is detected and reused across runs instead of re-downloaded.

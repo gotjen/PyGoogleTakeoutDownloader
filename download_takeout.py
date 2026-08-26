@@ -2,12 +2,20 @@
 
 import requests
 import os
+import shutil
 import time
 import re
 from pathlib import Path
 from datetime import datetime
 import json
 import logging
+
+# Files are downloaded here first, then moved to the configured
+# output_directory once complete. Keeping this local (and gitignored) means
+# the slow, expensive part — streaming a many-GB file from Google — never
+# touches a potentially flaky network/FUSE-mounted destination; only the
+# final move does, and that's cheap to retry without re-downloading.
+TEMP_DIR = Path(__file__).resolve().parent / 'temp_download'
 
 def refresh_download_token():
     """
@@ -111,6 +119,30 @@ def describe_error_response(response, max_body_chars=500):
         f"  Body: {snippet or '<empty>'}"
     )
 
+def check_disk_space(path, required_bytes, label):
+    """
+    Verify at least `required_bytes` is free on the filesystem backing `path`.
+
+    Uses shutil.disk_usage (the `df`-equivalent) rather than shelling out to
+    `df`. TEMP_DIR and output_directory are commonly on different
+    filesystems (see module docstring), and a many-GB Takeout file is
+    expensive enough to fetch that running out of space mid-stream/mid-move
+    should be caught upfront rather than discovered as an OSError partway
+    through.
+    """
+    free = shutil.disk_usage(path).free
+    if free < required_bytes:
+        print(
+            f"Error: not enough free space at {label} ({path}): "
+            f"{free:,} bytes free, need {required_bytes:,} bytes"
+        )
+        logging.error(
+            f"Insufficient disk space at {label} ({path}): "
+            f"{free:,} free < {required_bytes:,} required"
+        )
+        return False
+    return True
+
 def _safe_unlink(path):
     """
     Best-effort cleanup of a partial download. On a flaky output mount
@@ -176,9 +208,10 @@ def main():
             logging.error(f"Persistent error parsing curl.txt: {e}")
             return 1
 
-    # Create output directory
+    # Create output directory and local staging directory
     outdir = Path(config['google_takeout'].get('output_directory', '/mnt/f/GoogleTakeout'))
     outdir.mkdir(parents=True, exist_ok=True)
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
     # Find last downloaded file
     start = config['authentication'].get('last_downloaded_index', 0)
@@ -229,33 +262,67 @@ def main():
                     return 1
                 continue
 
-            # Create unique temp filename
+            # outfile's name carries the download timestamp for traceability;
+            # tmpfile's name is stable (index-only) so a completed local
+            # download can be recognized and reused across runs.
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             outfile = outdir / f"takeout-{timestamp}Z-{i:03d}.zip"
-            tmpfile = outdir / f"tmp_{timestamp}_{i:03d}.zip"
-            
+            tmpfile = TEMP_DIR / f"takeout-{i:03d}.zip.part"
+
             # Get expected size
             total_size = int(response.headers.get('content-length', 0))
             if total_size:
                 print(f"Size: {total_size:,} bytes")
-            
-            print(f"Saving to {outfile.name}")
-            try:
-                with open(tmpfile, 'wb') as f:
-                    # 4 MiB chunks: at the default 8 KiB, a single large
-                    # (tens-of-GB) Takeout file means millions of Python-level
-                    # iterations for no benefit.
-                    for chunk in response.iter_content(chunk_size=4 * 1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
 
-                # Verify size if we got content-length
-                if total_size and tmpfile.stat().st_size != total_size:
-                    print("Error: Size mismatch")
-                    _safe_unlink(tmpfile)
+            if total_size and tmpfile.exists() and tmpfile.stat().st_size == total_size:
+                # Already fully downloaded locally — likely a previous run
+                # got through the download but failed moving it to outdir.
+                # Don't re-download; just close this response and move on.
+                print(f"Found complete local copy at {tmpfile}, skipping re-download")
+                response.close()
+            else:
+                if total_size and not check_disk_space(TEMP_DIR, total_size, "temp download dir"):
+                    response.close()
                     return 1
 
-                tmpfile.rename(outfile)
+                print(f"Saving to {tmpfile}")
+                try:
+                    with open(tmpfile, 'wb') as f:
+                        # 4 MiB chunks: at the default 8 KiB, a single large
+                        # (tens-of-GB) Takeout file means millions of
+                        # Python-level iterations for no benefit.
+                        for chunk in response.iter_content(chunk_size=4 * 1024 * 1024):
+                            if chunk:
+                                f.write(chunk)
+
+                    # Verify size if we got content-length
+                    if total_size and tmpfile.stat().st_size != total_size:
+                        print("Error: Size mismatch")
+                        _safe_unlink(tmpfile)
+                        return 1
+
+                except OSError as e:
+                    # A genuinely local disk problem (out of space, etc) —
+                    # TEMP_DIR lives in the repo, not on a network mount, so
+                    # this is unlikely but still shouldn't crash the script.
+                    print(f"Error: I/O error writing local temp file {tmpfile}: {e}")
+                    logging.error(f"I/O error writing temp file for {i}: {e}")
+                    _safe_unlink(tmpfile)
+                    return 1
+                except:
+                    _safe_unlink(tmpfile)
+                    raise
+
+            move_size = total_size or tmpfile.stat().st_size
+            if move_size and not check_disk_space(outdir, move_size, "output directory"):
+                return 1
+
+            print(f"Moving to {outfile}")
+            try:
+                # shutil.move (not Path.rename) since TEMP_DIR and outdir are
+                # commonly on different filesystems — rename() can't cross
+                # that boundary, move() falls back to copy+delete.
+                shutil.move(str(tmpfile), str(outfile))
 
                 # Update last downloaded index
                 config['authentication']['last_downloaded_index'] = i + 1
@@ -263,20 +330,16 @@ def main():
                     json.dump(config, f, indent=4)
 
             except OSError as e:
-                # A local disk error or, e.g., an rclone/FUSE-backed output
-                # directory hiccuping mid-write both surface as a plain
-                # OSError here — not something this script can fix, but it
-                # shouldn't crash the whole run either. last_downloaded_index
-                # was not advanced, so simply re-running resumes at file i.
-                print(f"Error: I/O error writing to {outdir}: {e}")
-                print("This is a disk/output-mount problem, not an auth problem —")
-                print(f"check that {outdir} is healthy, then re-run to resume at file {i}.")
-                logging.error(f"I/O error writing file {i} to {outdir}: {e}")
-                _safe_unlink(tmpfile)
+                # E.g. an rclone/FUSE-backed output_directory hiccuping mid-
+                # copy. Not something this script can fix, but it shouldn't
+                # crash the run: the fully-downloaded file is still sitting
+                # safely in TEMP_DIR, so re-running retries just the move,
+                # not the expensive download.
+                print(f"Error: I/O error moving to {outdir}: {e}")
+                print(f"The downloaded file is safe at {tmpfile} —")
+                print(f"check that {outdir} is healthy, then re-run to retry the move.")
+                logging.error(f"I/O error moving file {i} to {outdir}: {e}")
                 return 1
-            except:
-                _safe_unlink(tmpfile)
-                raise
                 
         except requests.Timeout:
             print("Error: Request timed out")

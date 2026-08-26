@@ -94,6 +94,15 @@ left off) through `google_takeout.max_files`, waiting
 `google_takeout.download_delay` seconds between files, and updates
 `last_downloaded_index` in `secrets.json` after each successful file.
 
+Each file is downloaded into a local, gitignored `temp_download/` directory
+in the repo first, verified against `Content-Length`, and only then moved
+into your configured `output_directory`. This matters if that directory is a
+network/cloud-mounted drive (e.g. rclone) — the slow, expensive download
+never touches it directly, only the final move does, so a flaky mount only
+costs a retried move, not a redownload. If a run is interrupted after the
+download but before the move, re-running detects the completed file in
+`temp_download/` and reuses it instead of downloading again.
+
 ### 4. When the session goes stale
 
 If `curl.txt` is missing/unparseable, or a request comes back non-200 or HTML
