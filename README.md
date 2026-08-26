@@ -51,7 +51,7 @@ pip install -e .
 ```
 
 This installs the package and its dependencies, plus two commands:
-`configure-secrets` and `download-takeout`.
+`configure` and `download-takeout`.
 
 ## Workflow
 
@@ -63,10 +63,10 @@ session goes stale, at which point it pauses and asks you to recapture.
 ### 1. Configure
 
 ```bash
-configure-secrets
+configure
 ```
 
-Creates/validates `secrets.json` and interactively prompts for anything
+Creates/validates `config.json` and interactively prompts for anything
 missing: `output_directory`, `download_delay`, and `max_files` (how many
 indexed files your Takeout export was split into — check the Takeout page
 for this).
@@ -77,7 +77,7 @@ for this).
 download-takeout
 ```
 
-No command-line flags — it reads `secrets.json`, and prompts you to paste a
+No command-line flags — it reads `config.json`, and prompts you to paste a
 captured download session the first time it's needed (see below). On startup
 it scans `output_directory` for files it's already
 downloaded and resumes by filling in whatever's missing, from index 0

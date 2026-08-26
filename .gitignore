@@ -36,8 +36,8 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# Sensitive Configuration
-secrets.json
+# Local Configuration
+config.json
 *.secret
 .env
 

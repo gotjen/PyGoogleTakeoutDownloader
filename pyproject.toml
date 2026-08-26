@@ -23,7 +23,7 @@ dev = [
 
 [project.scripts]
 download-takeout = "pygoogletakeoutdownloader.download_takeout:cli"
-configure-secrets = "pygoogletakeoutdownloader.configure_secrets:main"
+configure = "pygoogletakeoutdownloader.configure:main"
 
 [tool.setuptools.package-dir]
 "" = "src"

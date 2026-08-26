@@ -5,12 +5,12 @@ import json
 import sys
 import logging
 
-class SecretsValidator:
-    def __init__(self, config_path='secrets.json'):
+class ConfigValidator:
+    def __init__(self, config_path='config.json'):
         """
-        Initialize secrets validator and configuration manager
+        Initialize configuration validator and manager
 
-        :param config_path: Path to secrets configuration file
+        :param config_path: Path to the configuration file
         """
         # Configure logging
         logging.basicConfig(
@@ -154,12 +154,12 @@ class SecretsValidator:
 
 def main():
     """
-    Main entry point for secrets configuration
+    Main entry point for the configuration wizard
     """
     print("Google Takeout Download Configuration Wizard")
     print("-------------------------------------------")
 
-    validator = SecretsValidator()
+    validator = ConfigValidator()
 
     # Validate existing configuration
     if not validator.validate_config():
@@ -174,4 +174,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-# Path: configure_secrets.py
+# Path: configure.py

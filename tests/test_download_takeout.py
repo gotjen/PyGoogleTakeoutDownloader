@@ -59,7 +59,7 @@ class TestDownloader(unittest.TestCase):
         """
         Test curl command without a job id (j=...). This is the bug that
         caused every real download to 500: job_id used to be pulled from a
-        stale secrets.json field ('unknown' by default) instead of the
+        stale config.json field ('unknown' by default) instead of the
         captured curl command, so it must now be required here too.
         """
         curl = """curl 'https://takeout.google.com/settings/takeout/download?rapt=test' -b 'cookie=test'"""
@@ -184,13 +184,13 @@ class TestDownloader(unittest.TestCase):
 
     def test_patch_config_field_preserves_concurrent_edits(self):
         """MoveWorker (and refresh_download_token()'s job_id persistence)
-        must not clobber a field added to secrets.json by someone/something
+        must not clobber a field added to config.json by someone/something
         else after the current process's own config was loaded into memory
         — confirmed in practice: a long-running invocation's stale
         in-memory config silently reverted a cdp_url added mid-run when
         MoveWorker used to re-dump its whole constructor-time snapshot."""
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / 'secrets.json'
+            path = Path(tmp) / 'config.json'
             path.write_text(json.dumps({
                 'google_takeout': {'cdp_url': 'http://127.0.0.1:9222'},
                 'authentication': {'last_downloaded_index': 5},
@@ -213,7 +213,7 @@ class TestDownloader(unittest.TestCase):
             self.assertEqual(scan_completed_indices(outdir), {0, 7})
 
     def _make_config(self, tmp):
-        config_path = Path(tmp) / 'secrets.json'
+        config_path = Path(tmp) / 'config.json'
         config_path.write_text(json.dumps({
             'google_takeout': {},
             'authentication': {'last_downloaded_index': 0},

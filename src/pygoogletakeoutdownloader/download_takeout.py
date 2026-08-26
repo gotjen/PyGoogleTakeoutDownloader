@@ -260,7 +260,7 @@ def patch_config_field(config_path, section, key, value):
 
     A long-running download_takeout.py invocation holds its config dict
     in memory for the whole run; if MoveWorker (or anything else) later
-    dumps that entire snapshot back to secrets.json, it silently reverts
+    dumps that entire snapshot back to config.json, it silently reverts
     any edit made to the file after the run started — e.g. a cdp_url
     added mid-run, or a second invocation's own in-memory copy. Confirmed
     in practice: MoveWorker used to do exactly that. Reading fresh from
@@ -405,12 +405,12 @@ def main():
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
 
-    # Read secrets configuration
+    # Read configuration
     try:
-        with open('secrets.json', 'r') as f:
+        with open('config.json', 'r') as f:
             config = json.load(f)
     except FileNotFoundError:
-        logging.error("secrets.json not found")
+        logging.error("config.json not found")
         return 1
 
     session = requests.Session()
@@ -472,7 +472,7 @@ def main():
     # copy into output_directory overlaps with the next file's download
     # instead of blocking it. exit_code (rather than early `return`s) lets
     # every exit path still fall through to the `finally` that joins it.
-    move_worker = MoveWorker('secrets.json', max_pending_moves)
+    move_worker = MoveWorker('config.json', max_pending_moves)
     exit_code = 0
     i = start
     try:
