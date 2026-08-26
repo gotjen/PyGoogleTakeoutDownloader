@@ -21,12 +21,18 @@ Workflow (see README.md's "Workflow" section for the full walkthrough):
 3. `download_takeout.py` replays that captured request with an incrementing
    file index (`requests`), streaming each Takeout zip into the local,
    gitignored `temp_download/` directory (inside the repo) first, verifying
-   size against `Content-Length`, then handing the verified file to a
-   background `MoveWorker` thread that `shutil.move`s it into the
-   configured `output_directory` and persists
-   `authentication.last_downloaded_index` in `secrets.json` so re-running
-   resumes automatically. It takes **no command-line arguments** —
-   everything comes from `secrets.json`/`curl.txt`.
+   size against `Content-Length` and checksum against the `x-goog-hash`
+   response header (see "CRC32C verification" below), then handing the
+   verified file to a background `MoveWorker` thread that `shutil.move`s it
+   into the configured `output_directory`. It takes **no command-line
+   arguments** — everything comes from `secrets.json`/`curl.txt`.
+   - **Resume is scan-based, not counter-based:** on startup, `main()` calls
+     `scan_completed_indices(outdir)` to find which `...-{index:03d}.zip`
+     files already exist, then always loops from index 0, skipping (with no
+     network request) any index already present. `last_downloaded_index` is
+     still written to `secrets.json` for informational purposes but is no
+     longer read for resume — see "Fixed" below for why that counter turned
+     out not to be trustworthy on its own.
    - **Why stage locally first:** `output_directory` is commonly a
      network/cloud-mounted destination (e.g. an `rclone` remote), which can
      throw transient `OSError`s under a sustained many-GB write. Downloading
@@ -71,14 +77,30 @@ Selenium script's homemade `curl` string (built from `<meta>` tag values)
 never reliably did — so manual capture is actually more robust for
 `download_takeout.py`'s `parse_curl()`, which requires both.
 
+### CRC32C verification
+
+The actual file bytes come from `takeout-download.usercontent.google.com`
+(the target of a redirect from `takeout.google.com/settings/takeout/download`
+that `requests` follows transparently), and that response carries an
+`x-goog-hash: crc32c=<base64>` header — confirmed against a real captured
+response in this environment. `parse_expected_crc32c()` decodes it (GCS
+convention: base64 of the big-endian 4-byte CRC32C/Castagnoli — *not* the
+polynomial `zlib.crc32` uses, hence the `crc32c` PyPI dependency) and
+`main()` compares it against a running checksum computed while streaming
+each file, or via `compute_file_crc32c()` for a reused local file. A
+mismatch is treated exactly like the existing size-mismatch case: the file
+is deleted and the run halts, so the next run's outdir scan (above) picks
+it back up. `md5=` may also appear in the header for some responses but
+isn't used — `crc32c` is always present in what's been observed so far.
+
 ## Scripts
 
 | File | Purpose |
 |---|---|
 | `credentials.py` | Shared credential storage/retrieval helpers (`is_keyring_available()`, `get_credential()`, `set_credential()`). Tries the OS keyring first, falls back to a plaintext `secrets.json` field (with a warning) only when keyring is unavailable, locked, or empty; `set_credential()` verifies writes with a read-back. Used by `configure_secrets.py`. |
 | `configure_secrets.py` | Interactive wizard (`SecretsValidator`). Loads/creates `secrets.json`, validates fields (via `credentials.get_credential`, so a keyring-backed value still validates even when blank on disk), prompts for missing values, and stores email/password/`two_factor_secret` via `credentials.set_credential`. `save_config()` blanks any field successfully stored in keyring before writing to disk. Run `python configure_secrets.py --migrate-to-keyring` to move existing plaintext credentials into keyring. **Note:** nothing currently reads these credentials back for a login step — see "Open question" below. |
-| `download_takeout.py` | The batch downloader — see Workflow above. Reads `secrets.json` + `curl.txt`, parses headers/cookies/`rapt` token from the curl string via regex (`parse_curl`), loops over file indices building download URLs (`create_url`), streams each file to a temp file, verifies size, then hands it to a background `MoveWorker` (moves into `output_directory` and persists `last_downloaded_index`, overlapping with the next download). `refresh_download_token()` prints manual-recapture instructions and blocks on `input()` — no subprocess/Selenium involved. |
-| `test_download_takeout.py` | `unittest` tests for `create_url()` / `parse_curl()`. |
+| `download_takeout.py` | The batch downloader — see Workflow above. Reads `secrets.json` + `curl.txt`, parses headers/cookies/`rapt` token from the curl string via regex (`parse_curl`), scans `output_directory` for already-completed indices (`scan_completed_indices`), loops from 0 skipping those, builds download URLs (`create_url`), streams each file to a temp file, verifies size and CRC32C (`parse_expected_crc32c`/`compute_file_crc32c`), then hands it to a background `MoveWorker` (moves into `output_directory`, overlapping with the next download). `refresh_download_token()` prints manual-recapture instructions and blocks on `input()` — no subprocess/Selenium involved. |
+| `test_download_takeout.py` | `unittest` tests for `create_url()`, `parse_curl()`, `parse_expected_crc32c()`, `compute_file_crc32c()`, `scan_completed_indices()`. |
 | `test_credentials.py` | `pytest` tests for `credentials.py`'s keyring-first/plaintext-fallback behavior. |
 | `test_configure_secrets.py` | `pytest` tests for `SecretsValidator`, including the keyring migration path and regression tests for the two bugs listed below. |
 
@@ -102,11 +124,11 @@ capture is manual" above.
 ## Dependencies
 
 Declared in `requirements.txt` (no `setup.py`/`pyproject.toml`): `requests`,
-`keyring`, `secretstorage` (Linux keyring backend), `pyotp` (currently
-unused — see below), `structlog` (currently unused, pre-existing), `urllib3`,
-plus `pytest`/`coverage` for testing. No Chrome/Chromium/chromedriver needed
-anymore. Per the README: create a venv, then `pip install -r
-requirements.txt`.
+`crc32c` (CRC32C verification — see above), `keyring`, `secretstorage`
+(Linux keyring backend), `pyotp` (currently unused — see below), `structlog`
+(currently unused, pre-existing), `urllib3`, plus `pytest`/`coverage` for
+testing. No Chrome/Chromium/chromedriver needed anymore. Per the README:
+create a venv, then `pip install -r requirements.txt`.
 
 ## Testing
 
@@ -211,3 +233,24 @@ this up.
   both `temp_download/` before writing and `output_directory` before
   queuing the move, so a full disk is caught upfront with a clear message
   instead of surfacing mid-transfer as an `OSError`.
+- **A stale-session token refresh silently skipped the failed file instead
+  of retrying it, and the loss was permanent.** Confirmed against a real
+  run: file 6 hit the HTML-auth-failure path, `refresh_download_token()`
+  succeeded, but the code did `continue` inside a
+  `for i in range(start, max_files):` loop — which advances to `i+1`, not a
+  retry of `i`. File 6 was abandoned; once file 7 then succeeded,
+  `MoveWorker` advanced `last_downloaded_index` to 8, permanently hiding
+  the gap from every future run (outdir ended up with `..., 04, 05, 07,
+  ...` — no 06). Fixed by converting the loop to manually-indexed
+  `while i < max_files`, incrementing `i` only after a real success; both
+  refresh-then-`continue` paths now retry the same `i`.
+- **Resume no longer trusts `last_downloaded_index` as the sole source of
+  truth** — the bug above demonstrated it can't be. `main()` now calls
+  `scan_completed_indices(outdir)` at startup and always loops from 0,
+  skipping (without a network request) any index already present, so a
+  resume backfills exactly what's missing regardless of what the stored
+  counter says.
+- **Added CRC32C verification** against Google's `x-goog-hash` response
+  header (see "CRC32C verification" above) — size matching alone can't
+  catch a same-size corruption, and this closes that gap using data Google
+  already sends on every response.

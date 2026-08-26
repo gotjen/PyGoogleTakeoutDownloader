@@ -7,6 +7,9 @@ import threading
 import queue
 import time
 import re
+import base64
+import struct
+import crc32c
 from pathlib import Path
 from datetime import datetime
 import json
@@ -139,6 +142,40 @@ def scan_completed_indices(outdir):
         if m:
             indices.add(int(m.group(1)))
     return indices
+
+def parse_expected_crc32c(x_goog_hash_header):
+    """
+    Extract the CRC32C checksum from an `x-goog-hash` response header
+    (e.g. "crc32c=DC95Hw==,md5=..."), returning it as an int, or None if
+    the header is missing or carries no crc32c entry.
+
+    Google's takeout-download.usercontent.google.com responses (the target
+    of the redirect from takeout.google.com/settings/takeout/download,
+    which `requests` follows transparently) carry this header — confirmed
+    against a real captured response. It's the GCS convention: base64 of
+    the big-endian 4-byte CRC32C (Castagnoli, not zlib.crc32's polynomial).
+    """
+    if not x_goog_hash_header:
+        return None
+    for part in x_goog_hash_header.split(','):
+        part = part.strip()
+        if part.startswith('crc32c='):
+            try:
+                return struct.unpack('>I', base64.b64decode(part[len('crc32c='):]))[0]
+            except (ValueError, struct.error):
+                return None
+    return None
+
+def compute_file_crc32c(path, chunk_size=4 * 1024 * 1024):
+    """CRC32C of an existing file on disk, read in the same chunk size used
+    for downloading (see main()'s streaming loop)."""
+    crc = 0
+    with open(path, 'rb') as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                return crc
+            crc = crc32c.crc32c(chunk, crc)
 
 def check_disk_space(path, required_bytes, label):
     """
@@ -408,10 +445,11 @@ def main():
                 outfile = outdir / f"takeout-{timestamp}Z-{i:03d}.zip"
                 tmpfile = TEMP_DIR / f"takeout-{i:03d}.zip.part"
 
-                # Get expected size
+                # Get expected size and checksum
                 total_size = int(response.headers.get('content-length', 0))
                 if total_size:
                     print(f"Size: {total_size:,} bytes")
+                expected_crc32c = parse_expected_crc32c(response.headers.get('x-goog-hash'))
 
                 if total_size and tmpfile.exists() and tmpfile.stat().st_size == total_size:
                     # Already fully downloaded locally — likely a previous
@@ -420,6 +458,11 @@ def main():
                     # and move on.
                     print(f"Found complete local copy at {tmpfile}, skipping re-download")
                     response.close()
+                    if expected_crc32c is not None and compute_file_crc32c(tmpfile) != expected_crc32c:
+                        print("Error: CRC32C mismatch on existing local copy")
+                        _safe_unlink(tmpfile)
+                        exit_code = 1
+                        break
                 else:
                     if total_size and not check_disk_space(TEMP_DIR, total_size, "temp download dir"):
                         response.close()
@@ -428,6 +471,7 @@ def main():
 
                     print(f"Saving to {tmpfile}")
                     try:
+                        crc = 0
                         with open(tmpfile, 'wb') as f:
                             # 4 MiB chunks: at the default 8 KiB, a single
                             # large (tens-of-GB) Takeout file means millions
@@ -435,10 +479,17 @@ def main():
                             for chunk in response.iter_content(chunk_size=4 * 1024 * 1024):
                                 if chunk:
                                     f.write(chunk)
+                                    crc = crc32c.crc32c(chunk, crc)
 
                         # Verify size if we got content-length
                         if total_size and tmpfile.stat().st_size != total_size:
                             print("Error: Size mismatch")
+                            _safe_unlink(tmpfile)
+                            exit_code = 1
+                            break
+
+                        if expected_crc32c is not None and crc != expected_crc32c:
+                            print("Error: CRC32C mismatch")
                             _safe_unlink(tmpfile)
                             exit_code = 1
                             break

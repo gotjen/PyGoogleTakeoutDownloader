@@ -1,5 +1,6 @@
 # Core Dependencies
 requests>=2.25.0
+crc32c>=2.7  # verifies downloads against the x-goog-hash response header
 
 # Security and Credential Management
 keyring>=24.0.0

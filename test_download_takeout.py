@@ -1,9 +1,23 @@
 #!/usr/bin/env python3
 
+import base64
+import struct
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
-from download_takeout import create_url, parse_curl, describe_error_response, _safe_unlink
+
+import crc32c
+
+from download_takeout import (
+    create_url,
+    parse_curl,
+    describe_error_response,
+    _safe_unlink,
+    parse_expected_crc32c,
+    compute_file_crc32c,
+    scan_completed_indices,
+)
 
 class TestDownloader(unittest.TestCase):
     def test_working_url_format(self):
@@ -108,6 +122,37 @@ class TestDownloader(unittest.TestCase):
         from datetime import datetime
         filename = f"takeout-{datetime.now().strftime('%Y%m%d')}T000000Z-042.zip"
         self.assertRegex(filename, r'takeout-\d{8}T\d{6}Z-\d{3}\.zip')
+
+    def test_parse_expected_crc32c_extracts_value(self):
+        """Real header format confirmed against a live Takeout download:
+        x-goog-hash: crc32c=DC95Hw==. Also handle a trailing md5= entry,
+        since GCS-style responses can carry both."""
+        raw = struct.pack('>I', 204437791)
+        header = f"crc32c={base64.b64encode(raw).decode()},md5=irrelevant=="
+        self.assertEqual(parse_expected_crc32c(header), 204437791)
+
+    def test_parse_expected_crc32c_missing_header(self):
+        self.assertIsNone(parse_expected_crc32c(None))
+        self.assertIsNone(parse_expected_crc32c(''))
+
+    def test_parse_expected_crc32c_no_crc32c_entry(self):
+        self.assertIsNone(parse_expected_crc32c('md5=irrelevant=='))
+
+    def test_compute_file_crc32c_matches_known_value(self):
+        data = b'hello world' * 10000  # bigger than one internal chunk
+        expected = crc32c.crc32c(data)
+        with tempfile.NamedTemporaryFile() as f:
+            f.write(data)
+            f.flush()
+            self.assertEqual(compute_file_crc32c(f.name, chunk_size=1024), expected)
+
+    def test_scan_completed_indices(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outdir = Path(tmp)
+            (outdir / 'takeout-20260101_000000Z-000.zip').touch()
+            (outdir / 'takeout-20260101_000000Z-007.zip').touch()
+            (outdir / 'not-a-takeout-file.txt').touch()
+            self.assertEqual(scan_completed_indices(outdir), {0, 7})
 
 if __name__ == '__main__':
     unittest.main()

@@ -88,27 +88,30 @@ python download_takeout.py
 ```
 
 No command-line flags — it reads everything from `secrets.json` and
-`curl.txt`. It downloads files sequentially starting at
-`authentication.last_downloaded_index` (so simply re-running resumes where it
-left off) through `google_takeout.max_files`, waiting
-`google_takeout.download_delay` seconds between files, and updates
-`last_downloaded_index` in `secrets.json` after each successful file.
+`curl.txt`. On startup it scans `output_directory` for files it's already
+downloaded and resumes by filling in whatever's missing, from index 0
+through `google_takeout.max_files` — so if a file gets skipped for any
+reason, the next run re-fetches exactly that one rather than trusting a
+single "last completed" counter (which was, in practice, once wrong after a
+mid-batch session refresh). It waits `google_takeout.download_delay`
+seconds between files.
 
 Each file is downloaded into a local, gitignored `temp_download/` directory
-in the repo first, verified against `Content-Length`, and only then moved
-into your configured `output_directory`. This matters if that directory is a
-network/cloud-mounted drive (e.g. rclone) — the slow, expensive download
-never touches it directly, only the final move does, so a flaky mount only
-costs a retried move, not a redownload. If a run is interrupted after the
-download but before the move, re-running detects the completed file in
-`temp_download/` and reuses it instead of downloading again.
+in the repo first, verified against `Content-Length` and against the
+CRC32C checksum Google's server returns (`x-goog-hash` header), and only
+then moved into your configured `output_directory`. This matters if that
+directory is a network/cloud-mounted drive (e.g. rclone) — the slow,
+expensive download never touches it directly, only the final move does, so
+a flaky mount only costs a retried move, not a redownload. If a run is
+interrupted after the download but before the move, re-running detects the
+completed file in `temp_download/` and reuses it (re-verifying its
+checksum) instead of downloading again.
 
 That move runs on a background thread, so it overlaps with the next file's
-download instead of blocking it — files are still moved, and
-`last_downloaded_index` still updated, strictly in order. Before writing or
-moving a file, the script also checks that both `temp_download/` and
-`output_directory` have enough free space, failing fast with a clear message
-rather than partway through a large transfer.
+download instead of blocking it — files are still moved strictly in order.
+Before writing or moving a file, the script also checks that both
+`temp_download/` and `output_directory` have enough free space, failing
+fast with a clear message rather than partway through a large transfer.
 
 ### 4. When the session goes stale
 
