@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 
 import json
-from unittest.mock import patch
 
 import pytest
 
-from configure_secrets import SecretsValidator
+from pygoogletakeoutdownloader.configure_secrets import SecretsValidator
 
 
 @pytest.fixture
@@ -13,83 +12,52 @@ def config_path(tmp_path):
     path = tmp_path / 'secrets.json'
     path.write_text(json.dumps({
         'google_takeout': {
-            'email': 'plaintext@example.com',
-            'password': 'plaintext-password',
-            'two_factor_secret': 'PLAINTEXT_SECRET',
             'max_files': 277,
             'output_directory': str(tmp_path),
             'download_delay': 5,
         },
-        'authentication': {'job_id': '', 'last_downloaded_index': 0, 'last_token_refresh': None},
-        'proxy': {'use_proxy': False},
-        'logging': {'log_file': 'takeout_download.log', 'log_level': 'INFO'},
+        'authentication': {'last_downloaded_index': 0},
     }))
     return path
 
 
-@patch('configure_secrets.credentials.set_credential', return_value=True)
-def test_migrate_moves_plaintext_to_keyring_and_blanks_disk(mock_set, config_path):
+def test_validate_config_passes_for_valid_config(config_path):
     validator = SecretsValidator(config_path=str(config_path))
-    result = validator.migrate_plaintext_to_keyring()
+    assert validator.validate_config() is True
 
-    assert result is True
-    assert {c.args[0] for c in mock_set.call_args_list} == {
-        'email', 'password', 'two_factor_secret'
-    }
+
+def test_validate_config_flags_invalid_output_directory(tmp_path, config_path):
+    validator = SecretsValidator(config_path=str(config_path))
+    validator.config['google_takeout']['output_directory'] = str(tmp_path / 'does-not-exist' / 'nested')
+    assert validator.validate_config() is False
+
+
+def test_validate_config_flags_non_positive_download_delay(config_path):
+    validator = SecretsValidator(config_path=str(config_path))
+    validator.config['google_takeout']['download_delay'] = 0
+    assert validator.validate_config() is False
+
+
+def test_validate_config_flags_non_positive_max_files(config_path):
+    validator = SecretsValidator(config_path=str(config_path))
+    validator.config['google_takeout']['max_files'] = -1
+    assert validator.validate_config() is False
+
+
+def test_save_config_writes_config_as_is(config_path):
+    validator = SecretsValidator(config_path=str(config_path))
+    validator.config['google_takeout']['download_delay'] = 10
+    validator.save_config()
 
     on_disk = json.loads(config_path.read_text())
-    assert on_disk['google_takeout']['email'] == ''
-    assert on_disk['google_takeout']['password'] == ''
-    assert on_disk['google_takeout']['two_factor_secret'] == ''
+    assert on_disk['google_takeout']['download_delay'] == 10
 
 
-@patch('configure_secrets.credentials.set_credential', return_value=False)
-def test_migrate_leaves_plaintext_when_keyring_write_fails(mock_set, config_path):
-    validator = SecretsValidator(config_path=str(config_path))
-    result = validator.migrate_plaintext_to_keyring()
+def test_default_config_created_when_file_missing(tmp_path):
+    missing_path = tmp_path / 'secrets.json'
+    validator = SecretsValidator(config_path=str(missing_path))
 
-    assert result is False
-    on_disk = json.loads(config_path.read_text())
-    assert on_disk['google_takeout']['email'] == 'plaintext@example.com'
-
-
-@patch('configure_secrets.credentials.is_keyring_available', return_value=False)
-def test_migrate_no_op_when_keyring_unavailable(mock_available, config_path):
-    validator = SecretsValidator(config_path=str(config_path))
-    result = validator.migrate_plaintext_to_keyring()
-
-    assert result is False
-    on_disk = json.loads(config_path.read_text())
-    assert on_disk['google_takeout']['email'] == 'plaintext@example.com'
-
-
-@patch('configure_secrets.credentials.set_credential', return_value=True)
-@patch('configure_secrets.credentials.get_credential')
-def test_store_credential_keeps_loop_condition_satisfied_on_keyring_success(
-    mock_get, mock_set, config_path
-):
-    """
-    Regression test: _store_credential() used to only update self.config on
-    the plaintext-fallback path, so prompt_for_missing_info()'s email loop
-    never saw a valid email once keyring storage succeeded and looped
-    forever. It must now see the just-entered value immediately.
-    """
-    validator = SecretsValidator(config_path=str(config_path))
-    validator._store_credential('google_takeout', 'email', 'new@example.com')
-
-    assert validator.config['google_takeout']['email'] == 'new@example.com'
-
-
-@patch('configure_secrets.credentials.set_credential', return_value=False)
-def test_store_credential_persists_two_factor_secret_on_plaintext_fallback(mock_set, config_path):
-    """
-    Regression test: the old fallback branch only special-cased email and
-    password, silently dropping two_factor_secret.
-    """
-    validator = SecretsValidator(config_path=str(config_path))
-    validator._store_credential('google_takeout', 'two_factor_secret', 'NEWSECRET')
-
-    on_disk = json.loads(config_path.read_text())
-    assert on_disk['google_takeout']['two_factor_secret'] == 'NEWSECRET'
+    assert validator.config['google_takeout']['max_files'] == 277
+    assert 'output_directory' in validator.config['google_takeout']
 
 # Path: test_configure_secrets.py

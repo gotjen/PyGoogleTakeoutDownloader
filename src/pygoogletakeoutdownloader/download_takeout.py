@@ -637,13 +637,22 @@ def main():
 
     return exit_code
 
-if __name__ == "__main__":
+def cli():
+    """
+    Entry point for both `python download_takeout.py` and the installed
+    `download-takeout` console script (see pyproject.toml) — kept separate
+    from main() so both invocations get the same top-level KeyboardInterrupt
+    handling below, not just the `__main__` block.
+    """
     try:
-        exit(main())
+        return main()
     except KeyboardInterrupt:
         # Catches an interrupt during setup, before main()'s own
         # try/except KeyboardInterrupt (and its MoveWorker) even exist.
         print("\nInterrupted before startup completed.")
-        exit(130)
+        return 130
+
+if __name__ == "__main__":
+    exit(cli())
 
 # Path: download_takeout.py

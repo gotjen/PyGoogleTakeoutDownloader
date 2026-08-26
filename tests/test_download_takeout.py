@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 
 import crc32c
 
-from download_takeout import (
+from pygoogletakeoutdownloader.download_takeout import (
     create_url,
     parse_curl,
     describe_error_response,
