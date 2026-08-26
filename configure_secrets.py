@@ -7,11 +7,7 @@ import sys
 import re
 import logging
 
-try:
-    import keyring
-    from keyring.errors import NoKeyringError
-except ImportError:
-    keyring = None
+import credentials
 
 class SecretsValidator:
     def __init__(self, config_path='secrets.json'):
@@ -32,6 +28,9 @@ class SecretsValidator:
 
         self.config_path = config_path
         self.config = self._load_config()
+        # Keys successfully written to keyring this run; save_config()
+        # blanks these on disk instead of writing them out as plaintext.
+        self._keyring_backed = set()
 
     def _load_config(self):
         """
@@ -92,33 +91,37 @@ class SecretsValidator:
         email_regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
         return re.match(email_regex, email) is not None
 
-    def _store_credential(self, service, username, password):
+    def _store_credential(self, service, username, value):
         """
-        Securely store credentials with fallback
-        
-        :param service: Service name
-        :param username: Username 
-        :param password: Password
+        Store a credential, preferring the OS keyring.
+
+        Always keeps the just-entered value in self.config in memory for
+        the rest of this run — regardless of where it's authoritatively
+        stored — so validation logic (e.g. the email prompt loop) has
+        something to check. save_config() is responsible for blanking any
+        keyring-backed field before it hits disk.
+
+        :param service: Keyring service name
+        :param username: Credential key (email/password/two_factor_secret)
+        :param value: Credential value
         """
-        # Check if keyring is available
-        if keyring:
-            try:
-                keyring.set_password(service, username, password)
-                self.logger.info(f"Credential stored securely for {username}")
-                return True
-            except (NoKeyringError, Exception) as e:
-                self.logger.warning(f"Keyring storage failed: {e}")
-        
+        stored_in_keyring = credentials.set_credential(
+            username, value, service=service, logger=self.logger
+        )
+
+        if service == 'google_takeout':
+            self.config.setdefault('google_takeout', {})[username] = value
+
+        if stored_in_keyring:
+            self.logger.info(f"Credential stored securely for {username}")
+            self._keyring_backed.add(username)
+            self.save_config()
+            return True
+
         # Fallback to configuration file (less secure)
         try:
-            # Update the specific section based on the service
-            if service == 'google_takeout' and username == 'email':
-                self.config['google_takeout']['email'] = password
-            elif service == 'google_takeout' and username == 'password':
-                self.config['google_takeout']['password'] = password
-            
             self.save_config()
-            self.logger.warning("Credentials stored in configuration file (not recommended)")
+            self.logger.warning("Credential stored in configuration file (not recommended)")
             return False
         except Exception as e:
             self.logger.error(f"Failed to store credential: {e}")
@@ -128,8 +131,12 @@ class SecretsValidator:
         """
         Interactively prompt for missing or invalid configuration
         """
-        # Email validation and input
-        while not self._validate_email(self.config['google_takeout']['email']):
+        # Email validation and input. Check keyring first (via
+        # credentials.get_credential) so an already-migrated email doesn't
+        # trigger a re-prompt just because it's blank in self.config.
+        while not self._validate_email(
+            credentials.get_credential('email', self.config, logger=self.logger) or ''
+        ):
             email = input("Enter your Google account email: ").strip()
             if self._validate_email(email):
                 # Attempt to store email securely
@@ -182,11 +189,22 @@ class SecretsValidator:
 
     def save_config(self):
         """
-        Save updated configuration to file
+        Save updated configuration to file.
+
+        Any credential successfully stored in the keyring this run is
+        blanked out in the on-disk copy — self.config keeps the real
+        in-memory value for the rest of this run, but the file never gets
+        a plaintext copy of a keyring-backed secret.
         """
+        to_write = json.loads(json.dumps(self.config))
+        google_takeout = to_write.get('google_takeout', {})
+        for key in self._keyring_backed:
+            if key in google_takeout:
+                google_takeout[key] = ''
+
         try:
             with open(self.config_path, 'w') as f:
-                json.dump(self.config, f, indent=4)
+                json.dump(to_write, f, indent=4)
             self.logger.info(f"Configuration saved to {self.config_path}")
         except Exception as e:
             self.logger.error(f"Error saving configuration: {e}")
@@ -200,8 +218,10 @@ class SecretsValidator:
         """
         errors = []
 
-        # Email validation
-        if not self._validate_email(self.config['google_takeout']['email']):
+        # Email validation — check keyring first, since a migrated/keyring-
+        # backed email is blanked out in self.config['google_takeout']['email'].
+        email = credentials.get_credential('email', self.config, logger=self.logger)
+        if not self._validate_email(email or ''):
             errors.append("Invalid email address")
 
         # Output directory validation
@@ -223,6 +243,46 @@ class SecretsValidator:
 
         return True
 
+    def migrate_plaintext_to_keyring(self):
+        """
+        One-time migration: move any plaintext email/password/
+        two_factor_secret still sitting in secrets.json into the OS
+        keyring, blanking each field on disk once its keyring write is
+        verified. Fields keyring can't accept are left as plaintext.
+
+        :return: True if every migratable field was moved, False otherwise
+        """
+        if not credentials.is_keyring_available():
+            self.logger.error(
+                "Keyring is not available on this system — nothing to migrate."
+            )
+            return False
+
+        google_takeout = self.config.get('google_takeout', {})
+        migrated, skipped = [], []
+
+        for key in ('email', 'password', 'two_factor_secret'):
+            value = google_takeout.get(key)
+            if not value:
+                continue
+            if credentials.set_credential(key, value, logger=self.logger):
+                self._keyring_backed.add(key)
+                migrated.append(key)
+            else:
+                skipped.append(key)
+
+        if migrated:
+            self.save_config()
+            self.logger.info(
+                f"Migrated to keyring and cleared from secrets.json: {', '.join(migrated)}"
+            )
+        if skipped:
+            self.logger.warning(f"Could not migrate (left as plaintext): {', '.join(skipped)}")
+        if not migrated and not skipped:
+            self.logger.info("No plaintext credentials found to migrate.")
+
+        return bool(migrated) and not skipped
+
 def main():
     """
     Main entry point for secrets configuration
@@ -230,8 +290,13 @@ def main():
     print("Google Takeout Download Configuration Wizard")
     print("-------------------------------------------")
 
+    if '--migrate-to-keyring' in sys.argv:
+        validator = SecretsValidator()
+        validator.migrate_plaintext_to_keyring()
+        return
+
     # Check for keyring availability
-    if not keyring:
+    if not credentials.is_keyring_available():
         print("\nWARNING: Keyring module not available.")
         print("Credentials will be stored in the configuration file.")
         print("This is NOT recommended for security reasons.\n")
