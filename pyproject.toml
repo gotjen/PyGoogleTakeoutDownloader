@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pygoogletakeoutdownloader"
+version = "0.1.0"
+description = "Batch-download a Google Takeout export split across many numbered zip files"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+dependencies = [
+    "requests>=2.25.0",
+    "crc32c>=2.7",  # verifies downloads against the x-goog-hash response header
+    "tqdm>=4.65.0",  # per-file download progress bar
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.3.0",
+    "coverage>=7.2.0",
+]
+
+[project.scripts]
+download-takeout = "pygoogletakeoutdownloader.download_takeout:cli"
+configure-secrets = "pygoogletakeoutdownloader.configure_secrets:main"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -4,28 +4,33 @@ Guidance for Claude Code when working in this repository.
 
 ## Project Overview
 
-**Google Takeout Batch Downloader** — a small collection of standalone Python
-scripts (no package/framework) that batch-download a Google Takeout export
-split across many numbered zip files. Google Takeout requires a fresh,
-short-lived authenticated download URL, and the session backing it expires
-periodically.
+**Google Takeout Batch Downloader** — a small Python package (`pyproject.toml`,
+`src/` layout) that batch-downloads a Google Takeout export split across many
+numbered zip files. Google Takeout requires a fresh, short-lived authenticated
+download URL, and the session backing it expires periodically.
+
+Installed as a package, it exposes two console scripts: `configure-secrets`
+and `download-takeout` (see "Layout" below for where the source actually
+lives).
 
 Workflow (see README.md's "Workflow" section for the full walkthrough):
 
-1. `configure_secrets.py` sets up `secrets.json` (output directory, file
+1. `configure-secrets` sets up `secrets.json` (output directory, file
    count, download delay).
-2. **The user manually captures an authenticated download request** into
-   `curl.txt`, via their own browser's DevTools ("Copy as cURL" on the
-   Takeout download request). There is no automated login step — see
-   "Why capture is manual" below.
-3. `download_takeout.py` replays that captured request with an incrementing
+2. **The user manually captures an authenticated download request** and
+   pastes it directly into `download-takeout`'s prompt (DevTools "Copy as
+   cURL" on the Takeout download request). There is no automated login step
+   — see "Why capture is manual" below. Nothing is written to disk for
+   this — see "Session refresh" below.
+3. `download-takeout` replays that captured request with an incrementing
    file index (`requests`), streaming each Takeout zip into a local staging
    directory in the system temp folder first, verifying
    size against `Content-Length` and checksum against the `x-goog-hash`
    response header (see "CRC32C verification" below), then handing the
    verified file to a background `MoveWorker` thread that `shutil.move`s it
    into the configured `output_directory`. It takes **no command-line
-   arguments** — everything comes from `secrets.json`/`curl.txt`.
+   arguments** — everything comes from `secrets.json` and the pasted curl
+   capture.
    - **Resume is scan-based, not counter-based:** on startup, `main()` calls
      `scan_completed_indices(outdir)` to find which `...-{index:03d}.zip`
      files already exist, then always loops from index 0, skipping (with no
@@ -55,10 +60,10 @@ Workflow (see README.md's "Workflow" section for the full walkthrough):
      `rapt`/session look far more bot-like than the deliberately-throttled
      (`download_delay`) sequential pattern this project already relies on to
      avoid the bot detection described below.
-4. When the session goes stale (missing/unparseable `curl.txt`, or a
-   non-200/HTML response mid-download), `download_takeout.py` pauses, prints
-   the manual-recapture steps, and blocks on `input()` until the user
-   confirms `curl.txt` is updated.
+4. When the session goes stale (no session yet, or a non-200/HTML response
+   mid-download), `download-takeout` pauses and blocks on `input()`,
+   collecting a freshly pasted curl command directly — see "Session
+   refresh" below.
 
 ### Why capture is manual — Selenium-based login was removed
 
@@ -78,6 +83,48 @@ Selenium script's homemade `curl` string (built from `<meta>` tag values)
 never reliably did — so manual capture is actually more robust for
 `download_takeout.py`'s `parse_curl()`, which requires both.
 
+**A follow-up automation attempt (browser-launch + `rapt` auto-extraction via
+CDP/Playwright) was investigated in depth and abandoned — don't re-attempt
+this without reading the reasoning first:**
+- Launching a real Chrome binary as a plain `subprocess.Popen` (not
+  Playwright's/Selenium's own `launch()`, which sets
+  `navigator.webdriver=true`) and attaching via `connect_over_cdp()` *does*
+  sign in normally — that part is safe and works.
+- Auto-extracting a fresh `rapt` from that browser does not: `rapt` is not
+  present anywhere in the page (not in download links' hrefs, not in the
+  DOM) — it's appended by Google only in response to an actual human-driven
+  click/passkey challenge, on timing tied to Google's own reauth grace
+  window, which this project has no way to observe or force. A
+  Playwright-driven synthetic click just follows the link's static href
+  (no `rapt` ever appears) — the same category of anti-automation
+  protection as the Selenium rejection above, just triggered by click
+  *authenticity* rather than sign-in automation. Polling the page for a
+  human-triggered `rapt` to transiently appear was also tried and abandoned
+  as unreliably timed.
+- The part that *is* a durable improvement, and is what's actually
+  implemented: `refresh_download_token()` prompts for the curl paste
+  directly instead of requiring a `curl.txt` file edit — see "Session
+  refresh" below.
+
+### Session refresh — pasted directly, not via `curl.txt`
+
+`refresh_download_token()` (in `download_takeout.py`) prints a short prompt
+and reads a multi-line curl command via repeated `input()` calls (submitted
+with a blank line), parses it with the same `parse_curl()` used for the
+optional legacy `curl.txt` bootstrap, and returns an `AuthState` — headers,
+cookies, `rapt`, `job_id` as one `typing.NamedTuple` — applied straight to
+the `requests.Session` via `apply_auth_state()`. Nothing is written to disk:
+the previous design wrote a fresh `curl.txt` on every refresh, which meant a
+full cookie jar sitting in a plaintext file for the run's duration; pasting
+directly avoids that with no functional downside, since `curl.txt` was only
+ever a hop between the browser and the session object anyway.
+
+`curl.txt` on disk is now purely an **optional legacy bootstrap**: if one
+exists at startup, `load_curl_state()` reads it (informational
+`describe_curl_age()` staleness warning included); if not,
+`refresh_download_token()` prompts for a paste immediately. Refreshes mid-run
+never write one.
+
 ### CRC32C verification
 
 The actual file bytes come from `takeout-download.usercontent.google.com`
@@ -94,84 +141,103 @@ is deleted and the run halts, so the next run's outdir scan (above) picks
 it back up. `md5=` may also appear in the header for some responses but
 isn't used — `crc32c` is always present in what's been observed so far.
 
+## Layout
+
+A packaged project (`pyproject.toml`, `src/` layout), not flat scripts:
+
+```
+src/pygoogletakeoutdownloader/
+    __init__.py
+    download_takeout.py
+    configure_secrets.py
+tests/
+    test_download_takeout.py
+    test_configure_secrets.py
+```
+
+Installed (`pip install -e .`) with two console-script entry points
+(`[project.scripts]` in `pyproject.toml`): `download-takeout` →
+`pygoogletakeoutdownloader.download_takeout:cli`, and `configure-secrets` →
+`pygoogletakeoutdownloader.configure_secrets:main`. `cli()` wraps `main()`
+with the top-level `KeyboardInterrupt` handling — kept separate so that
+handling applies whether invoked via the installed command or
+`python src/pygoogletakeoutdownloader/download_takeout.py` directly (only
+the `if __name__ == "__main__":` block would otherwise get it).
+
 ## Scripts
 
 | File | Purpose |
 |---|---|
-| `credentials.py` | Shared credential storage/retrieval helpers (`is_keyring_available()`, `get_credential()`, `set_credential()`). Tries the OS keyring first, falls back to a plaintext `secrets.json` field (with a warning) only when keyring is unavailable, locked, or empty; `set_credential()` verifies writes with a read-back. Used by `configure_secrets.py`. |
-| `configure_secrets.py` | Interactive wizard (`SecretsValidator`). Loads/creates `secrets.json`, validates fields (via `credentials.get_credential`, so a keyring-backed value still validates even when blank on disk), prompts for missing values, and stores email/password/`two_factor_secret` via `credentials.set_credential`. `save_config()` blanks any field successfully stored in keyring before writing to disk. Run `python configure_secrets.py --migrate-to-keyring` to move existing plaintext credentials into keyring. **Note:** nothing currently reads these credentials back for a login step — see "Open question" below. |
-| `download_takeout.py` | The batch downloader — see Workflow above. Reads `secrets.json` + `curl.txt`, parses headers/cookies/`rapt` token from the curl string via regex (`parse_curl`), scans `output_directory` for already-completed indices (`scan_completed_indices`), loops from 0 skipping those, builds download URLs (`create_url`), streams each file to a temp file, verifies size and CRC32C (`parse_expected_crc32c`/`compute_file_crc32c`), then hands it to a background `MoveWorker` (moves into `output_directory`, overlapping with the next download). `refresh_download_token()` prints manual-recapture instructions and blocks on `input()` — no subprocess/Selenium involved. |
-| `test_download_takeout.py` | `unittest` tests for `create_url()`, `parse_curl()`, `parse_expected_crc32c()`, `compute_file_crc32c()`, `scan_completed_indices()`. |
-| `test_credentials.py` | `pytest` tests for `credentials.py`'s keyring-first/plaintext-fallback behavior. |
-| `test_configure_secrets.py` | `pytest` tests for `SecretsValidator`, including the keyring migration path and regression tests for the two bugs listed below. |
+| `download_takeout.py` | The batch downloader — see Workflow above. Reads `secrets.json`, applies an `AuthState` (headers/cookies/`rapt`/`job_id` — from a pasted curl paste or the optional legacy `curl.txt`) to a `requests.Session` via `apply_auth_state()`, scans `output_directory` for already-completed indices (`scan_completed_indices`), loops from 0 skipping those, builds download URLs (`create_url`), streams each file to a temp file, verifies size and CRC32C (`parse_expected_crc32c`/`compute_file_crc32c`), then hands it to a background `MoveWorker` (moves into `output_directory`, overlapping with the next download). `refresh_download_token()` prompts for a pasted curl command directly — see "Session refresh" above. `patch_config_field()` does a narrow read-modify-write of one `secrets.json` field (used by `MoveWorker` for `last_downloaded_index`), rather than re-dumping a possibly-stale in-memory config snapshot that could revert a concurrent edit. |
+| `configure_secrets.py` | Interactive wizard (`SecretsValidator`). Loads/creates `secrets.json`, validates and prompts for `output_directory`/`download_delay`/`max_files`. No credential storage — see "Removed: credential storage" below. |
+| `test_download_takeout.py` | `unittest` tests for `create_url()`, `parse_curl()`, `AuthState`, `extract_rapt()`/`extract_job_id()`, `patch_config_field()`, `parse_expected_crc32c()`, `compute_file_crc32c()`, `scan_completed_indices()`. |
+| `test_configure_secrets.py` | `pytest` tests for `SecretsValidator`'s config validation/defaults. |
 
 **Removed:** `token_retriever.py` and `secure_token_retriever.py` (Selenium
 login scripts) and `test_secure_token_retriever.py`, along with the
 `selenium`/`webdriver-manager`/`pytest-selenium` dependencies — see "Why
 capture is manual" above.
 
+**Removed: credential storage.** `credentials.py` (shared
+keyring-with-plaintext-fallback helpers) and `configure_secrets.py`'s
+email/password/`two_factor_secret` prompting/storage (plus its
+`--migrate-to-keyring` flag) were deleted outright, along with
+`test_credentials.py`. These were already fully dead code — nothing had read
+them back for any functional purpose since the Selenium login step that used
+to consume them was removed (this used to be flagged here as an unresolved
+"Open question"; it's now resolved by deletion). A follow-up idea — keyring-
+persisting the *pasted curl's* parsed `AuthState` for crash/restart
+resilience within `rapt`'s own short validity window — was considered and
+declined too: the benefit is narrow (it doesn't reduce how often a fresh
+paste is needed, only survives a restart within the same few-minute window),
+and reintroducing `credentials.py` for that alone wasn't judged worth it.
+
 ## Config / state files (all gitignored)
 
-- **`secrets.json`** — created by `configure_secrets.py`. Structure:
-  `google_takeout.{email, password, two_factor_secret, max_files,
-  output_directory, download_delay}`, `authentication.{job_id,
-  last_downloaded_index, last_token_refresh}`, `proxy.*`, `logging.*`.
-- **`curl.txt`** — the captured authenticated download request, captured
-  manually via browser DevTools (see Workflow above); consumed by
-  `download_takeout.py`.
-- **`takeout_download.log`** — run log (format configured in
-  `download_takeout.py`'s `main()`).
+- **`secrets.json`** — created by `configure-secrets`. Structure:
+  `google_takeout.{max_files, output_directory, download_delay}`,
+  `authentication.{last_downloaded_index}`.
+- **`curl.txt`** — optional legacy bootstrap only; not written by
+  `refresh_download_token()` anymore — see "Session refresh" above.
 
 ## Dependencies
 
-Declared in `requirements.txt` (no `setup.py`/`pyproject.toml`): `requests`,
-`crc32c` (CRC32C verification — see above), `keyring`, `secretstorage`
-(Linux keyring backend), `pyotp` (currently unused — see below), `structlog`
-(currently unused, pre-existing), `urllib3`, plus `pytest`/`coverage` for
-testing. No Chrome/Chromium/chromedriver needed anymore. Per the README:
-create a venv, then `pip install -r requirements.txt`.
+Declared in `pyproject.toml` (setuptools `src/`-layout build): `requests`,
+`crc32c` (CRC32C verification — see above), `tqdm` (per-file progress bar).
+Dev/test extras (`pip install -e ".[dev]"`): `pytest`, `coverage`. No
+Chrome/Chromium/chromedriver needed. `keyring`/`secretstorage`/`pyotp`/
+`structlog`/`urllib3` were all removed — the first three were only used by
+the now-deleted credential storage; the last two were already-unused,
+pre-existing dependencies.
 
 ## Testing
 
 ```bash
+pip install -e ".[dev]"
 pytest
 ```
 
-## Open question — credential storage without a consumer
+### Fixed in the session-refresh / packaging pass (this pass)
 
-`configure_secrets.py` still prompts for and stores a Google
-email/password/`two_factor_secret` (via `credentials.py`, preferring
-keyring). Since the Selenium login step that used to consume those was
-removed, **nothing in the codebase reads them back for any functional
-purpose anymore** — they're stored but inert. This hasn't been resolved
-either way (keep for a possible future non-Selenium login approach vs. strip
-credential storage out entirely) — flag it rather than assuming when picking
-this up.
-
-## Known issues / gotchas
-
-- **`pyotp`/`structlog` are unused dependencies.** `pyotp` was only ever
-  referenced (as a `# TODO`, never implemented) in the now-deleted
-  `secure_token_retriever.py`; `structlog` was never imported anywhere in the
-  repo, pre-dating this session's changes. Neither is load-bearing.
-- **`keyring` is listed in `requirements.txt` but may not be installed on
-  every machine** — check with `pip show keyring` (or
-  `credentials.is_keyring_available()`); `credentials.get_credential`/
-  `set_credential` degrade to the plaintext-fallback / no-op path
-  automatically either way.
-
-### Fixed in the keyring-retrieval refactor (still relevant — `configure_secrets.py` is still in use)
-
-- `configure_secrets.py`'s email prompt loop used to spin forever once
-  keyring storage succeeded (it checked
-  `self.config['google_takeout']['email']`, which `_store_credential()` never
-  updated on the keyring-success path). Fixed: `_store_credential()` now
-  always keeps the in-memory value current, and validation/loop conditions
-  go through `credentials.get_credential()`.
-- `two_factor_secret` used to silently never persist to `secrets.json` on the
-  plaintext-fallback path (the old `_store_credential()` fallback branch only
-  special-cased `email`/`password`). Fixed by generalizing the fallback to
-  any `google_takeout` key.
+- **`MoveWorker` used to silently revert concurrent edits to
+  `secrets.json`.** It held a config dict snapshot from process start and
+  re-dumped the *entire* thing on every successful move; any edit landing on
+  disk after the run started (a second invocation's own write, a hand edit)
+  got clobbered by the next move. Confirmed in practice. Fixed via
+  `patch_config_field()` — reads fresh from disk immediately before writing
+  just the one field each caller owns (`last_downloaded_index` for
+  `MoveWorker`).
+- **Console noise on a failed download.** A non-200 or HTML response used to
+  dump the full response body (often a wall of Google's minified JS/JSON
+  page state) straight to the console via `describe_error_response()`. That
+  detail now only goes to the debug log; the console gets one short,
+  actionable line.
+- Restructured from flat scripts into a `pyproject.toml`/`src`-layout
+  package with `download-takeout`/`configure-secrets` console scripts — see
+  "Layout" above. `requirements.txt` is gone.
+- Removed dead credential storage (`credentials.py`,
+  `configure_secrets.py`'s email/password/2FA handling) — see "Removed:
+  credential storage" above.
 
 ### Fixed after switching to manual `curl.txt` capture
 

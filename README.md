@@ -10,7 +10,6 @@ A comprehensive, secure Python solution for automating the download of large Goo
 ## Features
 
 - Batch download of multiple Takeout files
-- Secure credential management
 - Detailed logging and error handling
 - Resumable downloads
 
@@ -47,9 +46,12 @@ source venv/bin/activate
 # Upgrade pip
 pip install --upgrade pip
 
-# Install dependencies
-pip install -r requirements.txt
+# Install the package (editable, so source edits take effect immediately)
+pip install -e .
 ```
+
+This installs the package and its dependencies, plus two commands:
+`configure-secrets` and `download-takeout`.
 
 ## Workflow
 
@@ -61,34 +63,23 @@ session goes stale, at which point it pauses and asks you to recapture.
 ### 1. Configure
 
 ```bash
-python configure_secrets.py
+configure-secrets
 ```
 
 Creates/validates `secrets.json` and interactively prompts for anything
-missing: `output_directory`, `download_delay`, `max_files` (how many indexed
-files your Takeout export was split into — check the Takeout page for this),
-and optionally an email/password (see "About the stored credentials" below —
-they aren't currently used by any download step).
+missing: `output_directory`, `download_delay`, and `max_files` (how many
+indexed files your Takeout export was split into — check the Takeout page
+for this).
 
-### 2. Capture a download session into `curl.txt`
-
-1. In a normal browser, sign into the Google account your Takeout export
-   belongs to, then go to `https://takeout.google.com/settings/takeout`.
-2. Click **Download** (or open an existing export's Download link).
-3. Open DevTools (F12) → **Network** tab, find the request whose URL starts
-   with `download?...` under `takeout.google.com`, right-click it, and choose
-   **Copy → Copy as cURL**.
-4. Paste it into `curl.txt` in this repo's root, replacing the file's
-   contents.
-
-### 3. Run the downloader
+### 2. Run the downloader
 
 ```bash
-python download_takeout.py
+download-takeout
 ```
 
-No command-line flags — it reads everything from `secrets.json` and
-`curl.txt`. On startup it scans `output_directory` for files it's already
+No command-line flags — it reads `secrets.json`, and prompts you to paste a
+captured download session the first time it's needed (see below). On startup
+it scans `output_directory` for files it's already
 downloaded and resumes by filling in whatever's missing, from index 0
 through `google_takeout.max_files` — so if a file gets skipped for any
 reason, the next run re-fetches exactly that one rather than trusting a
@@ -115,12 +106,26 @@ Before writing or moving a file, the script also checks that both the
 staging directory and `output_directory` have enough free space, failing
 fast with a clear message rather than partway through a large transfer.
 
-### 4. When the session goes stale
+### When the session goes stale
 
-If `curl.txt` is missing/unparseable, or a request comes back non-200 or HTML
-(Google's way of saying the session died), `download_takeout.py` pauses,
-prints the capture steps from step 2 again, and waits on `Enter` for you to
-confirm `curl.txt` has been refreshed before it continues the same run.
+The first time a valid session is needed (startup, or a request comes back
+non-200 or HTML — Google's way of saying the session died), `download-takeout`
+pauses and prompts you to capture and paste a fresh one:
+
+1. In a normal browser, sign into the Google account your Takeout export
+   belongs to, then go to `https://takeout.google.com/settings/takeout`.
+2. Click **Download** (or open an existing export's Download link).
+3. Open DevTools (F12) → **Network** tab, find the request whose URL starts
+   with `download?...` under `takeout.google.com`, right-click it, and choose
+   **Copy → Copy as cURL**.
+4. Paste it into the running `download-takeout` prompt (it's multi-line —
+   paste it all, then press Enter on an empty line to submit). Nothing is
+   written to disk — it's parsed and applied straight to the current run.
+
+This will keep happening every ~10 minutes or so of real run time: the
+`rapt` token Google issues is time-limited regardless of activity, not just
+idle-timed out, so expect to repeat this capture-and-paste step roughly
+every 3 files across a large export.
 
 ### Why capture is manual
 
@@ -131,30 +136,15 @@ field ever appeared — regardless of headless/non-headless mode or selector
 fixes. That's confirmed behavior from a real run against this project, not a
 theoretical concern, and no amount of selector maintenance would fix it.
 
-### About the stored credentials
-
-`configure_secrets.py` can still prompt for and store a Google
-email/password/two-factor secret (via `credentials.py`, preferring the OS
-keyring). Nothing in the current codebase actually reads them for a login
-step anymore, since that's now entirely manual — they're currently just
-config, not something the downloader depends on.
-
-### Migrating existing plaintext credentials to keyring
-```bash
-# Move any plaintext email/password/two_factor_secret out of secrets.json
-# and into the OS keyring
-python configure_secrets.py --migrate-to-keyring
-```
-
 ### Logging
-- Logs saved to `takeout_download.log`
-- Configurable log levels in `secrets.json`
+- Logs print to the console (stderr); redirect if you want them in a file,
+  e.g. `download-takeout 2> takeout_download.log`
 
 ## Troubleshooting
 
 - Check network connectivity and disk space.
-- If `curl.txt` is stale/missing, `download_takeout.py` will prompt you
-  through recapturing it — see Workflow above.
+- If the session goes stale, `download-takeout` will prompt you to paste a
+  fresh capture — see Workflow above.
 - Automated (browser-driven) sign-in is not attempted at all anymore; don't
   expect it to "just log in."
 
@@ -164,6 +154,9 @@ python configure_secrets.py --migrate-to-keyring
 ```bash
 # Activate virtual environment
 source venv/bin/activate
+
+# Install test dependencies (pytest, coverage)
+pip install -e ".[dev]"
 
 # Run tests
 pytest

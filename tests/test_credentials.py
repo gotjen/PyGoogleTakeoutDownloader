@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-import credentials
+from pygoogletakeoutdownloader import credentials
 
 
 @pytest.fixture
@@ -22,19 +22,19 @@ def test_is_keyring_available_false_when_module_absent():
         assert credentials.is_keyring_available() is False
 
 
-@patch('credentials.keyring.get_password')
+@patch('pygoogletakeoutdownloader.credentials.keyring.get_password')
 def test_get_credential_prefers_keyring(mock_get_password, config):
     mock_get_password.return_value = 'from-keyring'
     assert credentials.get_credential('email', config) == 'from-keyring'
 
 
-@patch('credentials.keyring.get_password')
+@patch('pygoogletakeoutdownloader.credentials.keyring.get_password')
 def test_get_credential_falls_back_to_config_when_keyring_empty(mock_get_password, config):
     mock_get_password.return_value = None
     assert credentials.get_credential('email', config) == 'plaintext@example.com'
 
 
-@patch('credentials.keyring.get_password')
+@patch('pygoogletakeoutdownloader.credentials.keyring.get_password')
 def test_get_credential_falls_back_to_config_when_keyring_raises(mock_get_password, config):
     mock_get_password.side_effect = Exception('locked')
     assert credentials.get_credential('email', config) == 'plaintext@example.com'
@@ -52,22 +52,22 @@ def test_get_credential_warns_on_plaintext_fallback(config, caplog):
     assert any('plaintext' in record.message for record in caplog.records)
 
 
-@patch('credentials.keyring.get_password')
-@patch('credentials.keyring.set_password')
+@patch('pygoogletakeoutdownloader.credentials.keyring.get_password')
+@patch('pygoogletakeoutdownloader.credentials.keyring.set_password')
 def test_set_credential_verifies_round_trip(mock_set_password, mock_get_password):
     mock_get_password.return_value = 'secret-value'
     assert credentials.set_credential('password', 'secret-value') is True
     mock_set_password.assert_called_once_with('google_takeout', 'password', 'secret-value')
 
 
-@patch('credentials.keyring.get_password')
-@patch('credentials.keyring.set_password')
+@patch('pygoogletakeoutdownloader.credentials.keyring.get_password')
+@patch('pygoogletakeoutdownloader.credentials.keyring.set_password')
 def test_set_credential_fails_when_readback_mismatches(mock_set_password, mock_get_password):
     mock_get_password.return_value = 'something-else'
     assert credentials.set_credential('password', 'secret-value') is False
 
 
-@patch('credentials.keyring.set_password')
+@patch('pygoogletakeoutdownloader.credentials.keyring.set_password')
 def test_set_credential_fails_when_keyring_raises(mock_set_password):
     mock_set_password.side_effect = Exception('no backend')
     assert credentials.set_credential('password', 'secret-value') is False
