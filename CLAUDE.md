@@ -10,7 +10,7 @@ split across many numbered zip files. Google Takeout requires a fresh,
 short-lived authenticated download URL, and the session backing it expires
 periodically.
 
-Workflow (see Readme.md's "Workflow" section for the full walkthrough):
+Workflow (see README.md's "Workflow" section for the full walkthrough):
 
 1. `configure_secrets.py` sets up `secrets.json` (output directory, file
    count, download delay).
@@ -19,11 +19,42 @@ Workflow (see Readme.md's "Workflow" section for the full walkthrough):
    Takeout download request). There is no automated login step — see
    "Why capture is manual" below.
 3. `download_takeout.py` replays that captured request with an incrementing
-   file index (`requests`), downloading each Takeout zip, verifying size
-   against `Content-Length`, and persisting
-   `authentication.last_downloaded_index` in `secrets.json` so re-running
-   resumes automatically. It takes **no command-line arguments** — everything
-   comes from `secrets.json`/`curl.txt`.
+   file index (`requests`), streaming each Takeout zip into a local staging
+   directory in the system temp folder first, verifying
+   size against `Content-Length` and checksum against the `x-goog-hash`
+   response header (see "CRC32C verification" below), then handing the
+   verified file to a background `MoveWorker` thread that `shutil.move`s it
+   into the configured `output_directory`. It takes **no command-line
+   arguments** — everything comes from `secrets.json`/`curl.txt`.
+   - **Resume is scan-based, not counter-based:** on startup, `main()` calls
+     `scan_completed_indices(outdir)` to find which `...-{index:03d}.zip`
+     files already exist, then always loops from index 0, skipping (with no
+     network request) any index already present. `last_downloaded_index` is
+     still written to `secrets.json` for informational purposes but is no
+     longer read for resume — see "Fixed" below for why that counter turned
+     out not to be trustworthy on its own.
+   - **Why stage locally first:** `output_directory` is commonly a
+     network/cloud-mounted destination (e.g. an `rclone` remote), which can
+     throw transient `OSError`s under a sustained many-GB write. Downloading
+     to local disk first means that failure mode only ever costs a retry of
+     the (cheap) move, never a re-download of the (expensive,
+     token-consuming) file from Google. A completed `*.part` file (in the
+     staging directory, under a stable per-index name) matching the
+     expected size is detected and reused on the next run instead of
+     re-downloading.
+   - **Why the move is backgrounded:** the move into `output_directory` is
+     the slow, network-bound half of each file (the download into the local
+     staging directory is the other half); running it on a `MoveWorker`
+     thread lets the next file's download start immediately instead of
+     blocking on it. The main loop checks `MoveWorker.error()` at the top of
+     each iteration and after the loop, and always joins the worker (even on
+     an early exit) before returning — it is deliberately not a daemon
+     thread, since letting the process exit mid-move could leave a
+     half-copied file at the destination. Concurrent *downloads* were
+     considered and rejected: several simultaneous requests under one
+     `rapt`/session look far more bot-like than the deliberately-throttled
+     (`download_delay`) sequential pattern this project already relies on to
+     avoid the bot detection described below.
 4. When the session goes stale (missing/unparseable `curl.txt`, or a
    non-200/HTML response mid-download), `download_takeout.py` pauses, prints
    the manual-recapture steps, and blocks on `input()` until the user
@@ -47,14 +78,30 @@ Selenium script's homemade `curl` string (built from `<meta>` tag values)
 never reliably did — so manual capture is actually more robust for
 `download_takeout.py`'s `parse_curl()`, which requires both.
 
+### CRC32C verification
+
+The actual file bytes come from `takeout-download.usercontent.google.com`
+(the target of a redirect from `takeout.google.com/settings/takeout/download`
+that `requests` follows transparently), and that response carries an
+`x-goog-hash: crc32c=<base64>` header — confirmed against a real captured
+response in this environment. `parse_expected_crc32c()` decodes it (GCS
+convention: base64 of the big-endian 4-byte CRC32C/Castagnoli — *not* the
+polynomial `zlib.crc32` uses, hence the `crc32c` PyPI dependency) and
+`main()` compares it against a running checksum computed while streaming
+each file, or via `compute_file_crc32c()` for a reused local file. A
+mismatch is treated exactly like the existing size-mismatch case: the file
+is deleted and the run halts, so the next run's outdir scan (above) picks
+it back up. `md5=` may also appear in the header for some responses but
+isn't used — `crc32c` is always present in what's been observed so far.
+
 ## Scripts
 
 | File | Purpose |
 |---|---|
 | `credentials.py` | Shared credential storage/retrieval helpers (`is_keyring_available()`, `get_credential()`, `set_credential()`). Tries the OS keyring first, falls back to a plaintext `secrets.json` field (with a warning) only when keyring is unavailable, locked, or empty; `set_credential()` verifies writes with a read-back. Used by `configure_secrets.py`. |
 | `configure_secrets.py` | Interactive wizard (`SecretsValidator`). Loads/creates `secrets.json`, validates fields (via `credentials.get_credential`, so a keyring-backed value still validates even when blank on disk), prompts for missing values, and stores email/password/`two_factor_secret` via `credentials.set_credential`. `save_config()` blanks any field successfully stored in keyring before writing to disk. Run `python configure_secrets.py --migrate-to-keyring` to move existing plaintext credentials into keyring. **Note:** nothing currently reads these credentials back for a login step — see "Open question" below. |
-| `download_takeout.py` | The batch downloader — see Workflow above. Reads `secrets.json` + `curl.txt`, parses headers/cookies/`rapt` token from the curl string via regex (`parse_curl`), loops over file indices building download URLs (`create_url`), streams each file to a temp file, verifies size, renames to final name, and persists `last_downloaded_index`. `refresh_download_token()` prints manual-recapture instructions and blocks on `input()` — no subprocess/Selenium involved. |
-| `test_download_takeout.py` | `unittest` tests for `create_url()` / `parse_curl()`. |
+| `download_takeout.py` | The batch downloader — see Workflow above. Reads `secrets.json` + `curl.txt`, parses headers/cookies/`rapt` token from the curl string via regex (`parse_curl`), scans `output_directory` for already-completed indices (`scan_completed_indices`), loops from 0 skipping those, builds download URLs (`create_url`), streams each file to a temp file, verifies size and CRC32C (`parse_expected_crc32c`/`compute_file_crc32c`), then hands it to a background `MoveWorker` (moves into `output_directory`, overlapping with the next download). `refresh_download_token()` prints manual-recapture instructions and blocks on `input()` — no subprocess/Selenium involved. |
+| `test_download_takeout.py` | `unittest` tests for `create_url()`, `parse_curl()`, `parse_expected_crc32c()`, `compute_file_crc32c()`, `scan_completed_indices()`. |
 | `test_credentials.py` | `pytest` tests for `credentials.py`'s keyring-first/plaintext-fallback behavior. |
 | `test_configure_secrets.py` | `pytest` tests for `SecretsValidator`, including the keyring migration path and regression tests for the two bugs listed below. |
 
@@ -78,11 +125,11 @@ capture is manual" above.
 ## Dependencies
 
 Declared in `requirements.txt` (no `setup.py`/`pyproject.toml`): `requests`,
-`keyring`, `secretstorage` (Linux keyring backend), `pyotp` (currently
-unused — see below), `structlog` (currently unused, pre-existing), `urllib3`,
-plus `pytest`/`coverage` for testing. No Chrome/Chromium/chromedriver needed
-anymore. Per the README: create a venv, then `pip install -r
-requirements.txt`.
+`crc32c` (CRC32C verification — see above), `keyring`, `secretstorage`
+(Linux keyring backend), `pyotp` (currently unused — see below), `structlog`
+(currently unused, pre-existing), `urllib3`, plus `pytest`/`coverage` for
+testing. No Chrome/Chromium/chromedriver needed anymore. Per the README:
+create a venv, then `pip install -r requirements.txt`.
 
 ## Testing
 
@@ -153,17 +200,69 @@ this up.
   the 500 above) usually explain themselves in the body far better than the
   status code alone.
 - **An `OSError` writing the output file crashed the whole run instead of
-  failing just that file.** Confirmed in practice: `output_directory` can be
-  (and in this environment is) an `rclone`/FUSE-mounted remote — streaming a
-  many-GB file through that continuously is exactly where a transient backend
-  hiccup surfaces as a plain `OSError: [Errno 5] Input/output error`, which
-  wasn't caught anywhere (only `requests.Timeout`/`requests.RequestException`
-  were). Worse, the cleanup `tmpfile.unlink()` calls weren't defensive
-  either, so a failing cleanup on the same flaky mount could itself raise and
-  obscure the original error. Fixed: a dedicated `except OSError` around the
-  per-file write/verify/rename block prints a clear disk/mount-specific
-  message and returns cleanly (re-running resumes at the same index, since
-  `last_downloaded_index` is only advanced after success); added
-  `_safe_unlink()` so cleanup failures are logged, not raised. Also bumped
-  `iter_content`'s chunk size from 8 KiB to 4 MiB — at 8 KiB a single
-  50+ GB file is millions of Python-level iterations for no benefit.
+  failing just that file.** `output_directory` can be a network/cloud-mounted
+  remote (e.g. `rclone`) — streaming a many-GB file through that continuously
+  is exactly where a transient backend hiccup surfaces as a plain
+  `OSError: [Errno 5] Input/output error`, which wasn't caught anywhere (only
+  `requests.Timeout`/`requests.RequestException` were). Worse, the cleanup
+  `tmpfile.unlink()` calls weren't defensive either, so a failing cleanup on
+  the same flaky mount could itself raise and obscure the original error.
+  Fixed: a dedicated `except OSError` around the per-file write/verify/rename
+  block prints a clear disk/mount-specific message and returns cleanly
+  (re-running resumes at the same index, since `last_downloaded_index` is
+  only advanced after success); added `_safe_unlink()` so cleanup failures
+  are logged, not raised. Also bumped `iter_content`'s chunk size from 8 KiB
+  to 4 MiB — at 8 KiB a single 50+ GB file is millions of Python-level
+  iterations for no benefit.
+- **Downloads now stage in a local directory before moving
+  to `output_directory`** (originally a repo-local `temp_download/`, later
+  moved to a stable subdirectory under the system temp folder — see
+  Workflow step 3 above), so the slow/expensive part (streaming from
+  Google) never touches a remote-mounted destination directly — only the
+  final `shutil.move()` does, which is cheap to retry without re-downloading
+  if the destination hiccups. A completed local file matching the expected
+  size is detected and reused across runs instead of re-downloaded.
+- **The move into `output_directory` now runs on a background `MoveWorker`
+  thread** instead of blocking the main loop, so it overlaps with the next
+  file's download. A move failure is recorded (`MoveWorker.error()`) rather
+  than raised across threads; the main loop checks it each iteration and
+  after the loop, converts it to the same exit-1 behavior the old synchronous
+  `except OSError` block had, and always joins the worker (via
+  `finally: move_worker.close()`) before returning so the process never exits
+  mid-move. Multiple *concurrent downloads* (as opposed to backgrounding the
+  move) were considered and deliberately not implemented — see Workflow
+  step 3 above.
+- Also added `check_disk_space()` (via `shutil.disk_usage`), checked against
+  both the local staging directory before writing and `output_directory`
+  before queuing the move, so a full disk is caught upfront with a clear
+  message instead of surfacing mid-transfer as an `OSError`.
+- **A stale-session token refresh silently skipped the failed file instead
+  of retrying it, and the loss was permanent.** Confirmed against a real
+  run: file 6 hit the HTML-auth-failure path, `refresh_download_token()`
+  succeeded, but the code did `continue` inside a
+  `for i in range(start, max_files):` loop — which advances to `i+1`, not a
+  retry of `i`. File 6 was abandoned; once file 7 then succeeded,
+  `MoveWorker` advanced `last_downloaded_index` to 8, permanently hiding
+  the gap from every future run (outdir ended up with `..., 04, 05, 07,
+  ...` — no 06). Fixed by converting the loop to manually-indexed
+  `while i < max_files`, incrementing `i` only after a real success; both
+  refresh-then-`continue` paths now retry the same `i`.
+- **Resume no longer trusts `last_downloaded_index` as the sole source of
+  truth** — the bug above demonstrated it can't be. `main()` now calls
+  `scan_completed_indices(outdir)` at startup and always loops from 0,
+  skipping (without a network request) any index already present, so a
+  resume backfills exactly what's missing regardless of what the stored
+  counter says.
+- **Added CRC32C verification** against Google's `x-goog-hash` response
+  header (see "CRC32C verification" above) — size matching alone can't
+  catch a same-size corruption, and this closes that gap using data Google
+  already sends on every response.
+- **Local staging moved out of the repo, into the system temp dir.** The
+  staging directory (`TEMP_DIR` in `download_takeout.py`) used to be
+  `<repo>/temp_download/`; it's now `tempfile.gettempdir() /
+  'pygoogletakeoutdownloader'` (e.g. `/tmp/pygoogletakeoutdownloader` on
+  Linux). Kept as a stable, fixed-name directory (not a fresh
+  `tempfile.mkdtemp()` per run) specifically so the existing crash-resume
+  behavior — a `.part` file that finished downloading but never got moved
+  is detected and reused, re-verified via CRC32C, on the next run — still
+  works.

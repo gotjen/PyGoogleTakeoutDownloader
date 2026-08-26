@@ -1,5 +1,7 @@
 # Core Dependencies
 requests>=2.25.0
+crc32c>=2.7  # verifies downloads against the x-goog-hash response header
+tqdm>=4.65.0  # per-file download progress bar
 
 # Security and Credential Management
 keyring>=24.0.0
