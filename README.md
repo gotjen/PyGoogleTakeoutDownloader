@@ -103,6 +103,13 @@ costs a retried move, not a redownload. If a run is interrupted after the
 download but before the move, re-running detects the completed file in
 `temp_download/` and reuses it instead of downloading again.
 
+That move runs on a background thread, so it overlaps with the next file's
+download instead of blocking it — files are still moved, and
+`last_downloaded_index` still updated, strictly in order. Before writing or
+moving a file, the script also checks that both `temp_download/` and
+`output_directory` have enough free space, failing fast with a clear message
+rather than partway through a large transfer.
+
 ### 4. When the session goes stale
 
 If `curl.txt` is missing/unparseable, or a request comes back non-200 or HTML

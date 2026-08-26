@@ -3,6 +3,8 @@
 import requests
 import os
 import shutil
+import threading
+import queue
 import time
 import re
 from pathlib import Path
@@ -155,6 +157,63 @@ def _safe_unlink(path):
     except OSError as e:
         logging.warning(f"Could not remove partial file {path}: {e}")
 
+class MoveWorker:
+    """
+    Background thread that moves verified downloads from TEMP_DIR into
+    output_directory and persists last_downloaded_index, so that (often
+    slow, network-mounted) move overlaps with the next file's download
+    instead of blocking the main loop on it.
+
+    Not a daemon thread: the caller must always call close() (e.g. in a
+    finally block) before exiting, since killing the process mid-move could
+    leave a half-copied file at the destination.
+    """
+
+    def __init__(self, config, config_path):
+        self._queue = queue.Queue()
+        self._config = config
+        self._config_path = config_path
+        self._error = None
+        self._thread = threading.Thread(target=self._run)
+        self._thread.start()
+
+    def submit(self, index, tmpfile, outfile):
+        self._queue.put((index, tmpfile, outfile))
+
+    def _run(self):
+        while True:
+            job = self._queue.get()
+            if job is None:
+                return
+            index, tmpfile, outfile = job
+            # Once one move has failed, skip the rest rather than moving
+            # files out of order or past a failure last_downloaded_index
+            # can't reflect anyway. They stay safely in TEMP_DIR.
+            if self._error is None:
+                try:
+                    # shutil.move (not Path.rename) since TEMP_DIR and
+                    # outdir are commonly on different filesystems —
+                    # rename() can't cross that boundary, move() falls back
+                    # to copy+delete.
+                    shutil.move(str(tmpfile), str(outfile))
+                    self._config['authentication']['last_downloaded_index'] = index + 1
+                    with open(self._config_path, 'w') as f:
+                        json.dump(self._config, f, indent=4)
+                    logging.info(f"Moved file {index} to {outfile}")
+                except OSError as e:
+                    logging.error(f"I/O error moving file {index} to {outfile}: {e}")
+                    self._error = (index, tmpfile, outfile, e)
+
+    def error(self):
+        """Return (index, tmpfile, outfile, exception) of the first failed
+        move, or None if none has failed (yet)."""
+        return self._error
+
+    def close(self):
+        """Wait for all queued moves (or the failure point) to finish."""
+        self._queue.put(None)
+        self._thread.join()
+
 def load_curl_state(session):
     """
     Read curl.txt, parse it, and apply its headers/cookies to `session`
@@ -221,137 +280,161 @@ def main():
 
     download_delay = config['google_takeout'].get('download_delay', 5)
 
-    for i in range(start, max_files):
-        print(f"\nDownloading file {i}...")
-        
-        url = create_url(i, job_id, rapt)
-        try:
-            response = session.get(url, stream=True)
-            
-            if response.status_code == 404:
-                print("File not found - archive may not be ready")
-                return 1
+    # Moves run on a background thread so the (often slow, network-mounted)
+    # copy into output_directory overlaps with the next file's download
+    # instead of blocking it. exit_code (rather than early `return`s) lets
+    # every exit path still fall through to the `finally` that joins it.
+    move_worker = MoveWorker(config, 'secrets.json')
+    exit_code = 0
+    try:
+        for i in range(start, max_files):
+            worker_error = move_worker.error()
+            if worker_error:
+                exit_code = 1
+                break
 
-            if response.status_code != 200:
-                description = describe_error_response(response)
-                print(f"Error: {description}")
-                logging.error(f"Download request failed: {description}")
-                # Attempt to refresh token
-                if not refresh_download_token():
-                    print("Failed to refresh download token")
-                    return 1
-                try:
-                    rapt, job_id = load_curl_state(session)
-                except (ValueError, IOError) as e:
-                    print(f"Error parsing recaptured curl.txt: {e}")
-                    return 1
-                continue
+            print(f"\nDownloading file {i}...")
 
-            if 'html' in response.headers.get('content-type', ''):
-                description = describe_error_response(response)
-                print(f"Error: Got HTML instead of file (auth failed). {description}")
-                logging.error(f"Got HTML instead of file: {description}")
-                # Attempt to refresh token
-                if not refresh_download_token():
-                    print("Failed to refresh download token")
-                    return 1
-                try:
-                    rapt, job_id = load_curl_state(session)
-                except (ValueError, IOError) as e:
-                    print(f"Error parsing recaptured curl.txt: {e}")
-                    return 1
-                continue
-
-            # outfile's name carries the download timestamp for traceability;
-            # tmpfile's name is stable (index-only) so a completed local
-            # download can be recognized and reused across runs.
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            outfile = outdir / f"takeout-{timestamp}Z-{i:03d}.zip"
-            tmpfile = TEMP_DIR / f"takeout-{i:03d}.zip.part"
-
-            # Get expected size
-            total_size = int(response.headers.get('content-length', 0))
-            if total_size:
-                print(f"Size: {total_size:,} bytes")
-
-            if total_size and tmpfile.exists() and tmpfile.stat().st_size == total_size:
-                # Already fully downloaded locally — likely a previous run
-                # got through the download but failed moving it to outdir.
-                # Don't re-download; just close this response and move on.
-                print(f"Found complete local copy at {tmpfile}, skipping re-download")
-                response.close()
-            else:
-                if total_size and not check_disk_space(TEMP_DIR, total_size, "temp download dir"):
-                    response.close()
-                    return 1
-
-                print(f"Saving to {tmpfile}")
-                try:
-                    with open(tmpfile, 'wb') as f:
-                        # 4 MiB chunks: at the default 8 KiB, a single large
-                        # (tens-of-GB) Takeout file means millions of
-                        # Python-level iterations for no benefit.
-                        for chunk in response.iter_content(chunk_size=4 * 1024 * 1024):
-                            if chunk:
-                                f.write(chunk)
-
-                    # Verify size if we got content-length
-                    if total_size and tmpfile.stat().st_size != total_size:
-                        print("Error: Size mismatch")
-                        _safe_unlink(tmpfile)
-                        return 1
-
-                except OSError as e:
-                    # A genuinely local disk problem (out of space, etc) —
-                    # TEMP_DIR lives in the repo, not on a network mount, so
-                    # this is unlikely but still shouldn't crash the script.
-                    print(f"Error: I/O error writing local temp file {tmpfile}: {e}")
-                    logging.error(f"I/O error writing temp file for {i}: {e}")
-                    _safe_unlink(tmpfile)
-                    return 1
-                except:
-                    _safe_unlink(tmpfile)
-                    raise
-
-            move_size = total_size or tmpfile.stat().st_size
-            if move_size and not check_disk_space(outdir, move_size, "output directory"):
-                return 1
-
-            print(f"Moving to {outfile}")
+            url = create_url(i, job_id, rapt)
             try:
-                # shutil.move (not Path.rename) since TEMP_DIR and outdir are
-                # commonly on different filesystems — rename() can't cross
-                # that boundary, move() falls back to copy+delete.
-                shutil.move(str(tmpfile), str(outfile))
+                response = session.get(url, stream=True)
 
-                # Update last downloaded index
-                config['authentication']['last_downloaded_index'] = i + 1
-                with open('secrets.json', 'w') as f:
-                    json.dump(config, f, indent=4)
+                if response.status_code == 404:
+                    print("File not found - archive may not be ready")
+                    exit_code = 1
+                    break
 
-            except OSError as e:
-                # E.g. an rclone/FUSE-backed output_directory hiccuping mid-
-                # copy. Not something this script can fix, but it shouldn't
-                # crash the run: the fully-downloaded file is still sitting
-                # safely in TEMP_DIR, so re-running retries just the move,
-                # not the expensive download.
-                print(f"Error: I/O error moving to {outdir}: {e}")
-                print(f"The downloaded file is safe at {tmpfile} —")
-                print(f"check that {outdir} is healthy, then re-run to retry the move.")
-                logging.error(f"I/O error moving file {i} to {outdir}: {e}")
-                return 1
-                
-        except requests.Timeout:
-            print("Error: Request timed out")
-            return 1
-        except requests.RequestException as e:
-            print(f"Error: {e}")
-            return 1
-            
-        print(f"Waiting {download_delay} seconds...")
-        time.sleep(download_delay)
-    
-    return 0
+                if response.status_code != 200:
+                    description = describe_error_response(response)
+                    print(f"Error: {description}")
+                    logging.error(f"Download request failed: {description}")
+                    # Attempt to refresh token
+                    if not refresh_download_token():
+                        print("Failed to refresh download token")
+                        exit_code = 1
+                        break
+                    try:
+                        rapt, job_id = load_curl_state(session)
+                    except (ValueError, IOError) as e:
+                        print(f"Error parsing recaptured curl.txt: {e}")
+                        exit_code = 1
+                        break
+                    continue
+
+                if 'html' in response.headers.get('content-type', ''):
+                    description = describe_error_response(response)
+                    print(f"Error: Got HTML instead of file (auth failed). {description}")
+                    logging.error(f"Got HTML instead of file: {description}")
+                    # Attempt to refresh token
+                    if not refresh_download_token():
+                        print("Failed to refresh download token")
+                        exit_code = 1
+                        break
+                    try:
+                        rapt, job_id = load_curl_state(session)
+                    except (ValueError, IOError) as e:
+                        print(f"Error parsing recaptured curl.txt: {e}")
+                        exit_code = 1
+                        break
+                    continue
+
+                # outfile's name carries the download timestamp for
+                # traceability; tmpfile's name is stable (index-only) so a
+                # completed local download can be recognized and reused
+                # across runs.
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                outfile = outdir / f"takeout-{timestamp}Z-{i:03d}.zip"
+                tmpfile = TEMP_DIR / f"takeout-{i:03d}.zip.part"
+
+                # Get expected size
+                total_size = int(response.headers.get('content-length', 0))
+                if total_size:
+                    print(f"Size: {total_size:,} bytes")
+
+                if total_size and tmpfile.exists() and tmpfile.stat().st_size == total_size:
+                    # Already fully downloaded locally — likely a previous
+                    # run got through the download but failed moving it to
+                    # outdir. Don't re-download; just close this response
+                    # and move on.
+                    print(f"Found complete local copy at {tmpfile}, skipping re-download")
+                    response.close()
+                else:
+                    if total_size and not check_disk_space(TEMP_DIR, total_size, "temp download dir"):
+                        response.close()
+                        exit_code = 1
+                        break
+
+                    print(f"Saving to {tmpfile}")
+                    try:
+                        with open(tmpfile, 'wb') as f:
+                            # 4 MiB chunks: at the default 8 KiB, a single
+                            # large (tens-of-GB) Takeout file means millions
+                            # of Python-level iterations for no benefit.
+                            for chunk in response.iter_content(chunk_size=4 * 1024 * 1024):
+                                if chunk:
+                                    f.write(chunk)
+
+                        # Verify size if we got content-length
+                        if total_size and tmpfile.stat().st_size != total_size:
+                            print("Error: Size mismatch")
+                            _safe_unlink(tmpfile)
+                            exit_code = 1
+                            break
+
+                    except OSError as e:
+                        # A genuinely local disk problem (out of space,
+                        # etc) — TEMP_DIR lives in the repo, not on a
+                        # network mount, so this is unlikely but still
+                        # shouldn't crash the script.
+                        print(f"Error: I/O error writing local temp file {tmpfile}: {e}")
+                        logging.error(f"I/O error writing temp file for {i}: {e}")
+                        _safe_unlink(tmpfile)
+                        exit_code = 1
+                        break
+                    except:
+                        _safe_unlink(tmpfile)
+                        raise
+
+                move_size = total_size or tmpfile.stat().st_size
+                if move_size and not check_disk_space(outdir, move_size, "output directory"):
+                    exit_code = 1
+                    break
+
+                print(f"Queued move to {outfile}")
+                move_worker.submit(i, tmpfile, outfile)
+
+            except requests.Timeout:
+                print("Error: Request timed out")
+                exit_code = 1
+                break
+            except requests.RequestException as e:
+                print(f"Error: {e}")
+                exit_code = 1
+                break
+
+            print(f"Waiting {download_delay} seconds...")
+            time.sleep(download_delay)
+    finally:
+        # Always join the worker, even on an early exit above: it isn't a
+        # daemon thread, since letting the process die mid-move could leave
+        # a half-copied file sitting at outfile.
+        move_worker.close()
+
+    if exit_code == 0:
+        worker_error = move_worker.error()
+        if worker_error:
+            index, tmpfile, outfile, e = worker_error
+            # E.g. an rclone/FUSE-backed output_directory hiccuping mid-
+            # copy. Not something this script can fix, but it shouldn't
+            # crash the run: the fully-downloaded file is still sitting
+            # safely in TEMP_DIR, so re-running retries just the move, not
+            # the expensive download.
+            print(f"Error: I/O error moving file {index} to {outfile}: {e}")
+            print(f"The downloaded file is safe at {tmpfile} —")
+            print(f"check that {outdir} is healthy, then re-run to retry the move.")
+            exit_code = 1
+
+    return exit_code
 
 if __name__ == "__main__":
     exit(main())

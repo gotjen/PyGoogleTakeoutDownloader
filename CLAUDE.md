@@ -21,8 +21,9 @@ Workflow (see README.md's "Workflow" section for the full walkthrough):
 3. `download_takeout.py` replays that captured request with an incrementing
    file index (`requests`), streaming each Takeout zip into the local,
    gitignored `temp_download/` directory (inside the repo) first, verifying
-   size against `Content-Length`, then `shutil.move`-ing the verified file
-   into the configured `output_directory` and persisting
+   size against `Content-Length`, then handing the verified file to a
+   background `MoveWorker` thread that `shutil.move`s it into the
+   configured `output_directory` and persists
    `authentication.last_downloaded_index` in `secrets.json` so re-running
    resumes automatically. It takes **no command-line arguments** —
    everything comes from `secrets.json`/`curl.txt`.
@@ -34,6 +35,19 @@ Workflow (see README.md's "Workflow" section for the full walkthrough):
      token-consuming) file from Google. A completed `temp_download/*.part`
      file matching the expected size is detected and reused on the next run
      instead of re-downloading.
+   - **Why the move is backgrounded:** the move into `output_directory` is
+     the slow, network-bound half of each file (the download into local
+     `temp_download/` is the other half); running it on a `MoveWorker`
+     thread lets the next file's download start immediately instead of
+     blocking on it. The main loop checks `MoveWorker.error()` at the top of
+     each iteration and after the loop, and always joins the worker (even on
+     an early exit) before returning — it is deliberately not a daemon
+     thread, since letting the process exit mid-move could leave a
+     half-copied file at the destination. Concurrent *downloads* were
+     considered and rejected: several simultaneous requests under one
+     `rapt`/session look far more bot-like than the deliberately-throttled
+     (`download_delay`) sequential pattern this project already relies on to
+     avoid the bot detection described below.
 4. When the session goes stale (missing/unparseable `curl.txt`, or a
    non-200/HTML response mid-download), `download_takeout.py` pauses, prints
    the manual-recapture steps, and blocks on `input()` until the user
@@ -63,7 +77,7 @@ never reliably did — so manual capture is actually more robust for
 |---|---|
 | `credentials.py` | Shared credential storage/retrieval helpers (`is_keyring_available()`, `get_credential()`, `set_credential()`). Tries the OS keyring first, falls back to a plaintext `secrets.json` field (with a warning) only when keyring is unavailable, locked, or empty; `set_credential()` verifies writes with a read-back. Used by `configure_secrets.py`. |
 | `configure_secrets.py` | Interactive wizard (`SecretsValidator`). Loads/creates `secrets.json`, validates fields (via `credentials.get_credential`, so a keyring-backed value still validates even when blank on disk), prompts for missing values, and stores email/password/`two_factor_secret` via `credentials.set_credential`. `save_config()` blanks any field successfully stored in keyring before writing to disk. Run `python configure_secrets.py --migrate-to-keyring` to move existing plaintext credentials into keyring. **Note:** nothing currently reads these credentials back for a login step — see "Open question" below. |
-| `download_takeout.py` | The batch downloader — see Workflow above. Reads `secrets.json` + `curl.txt`, parses headers/cookies/`rapt` token from the curl string via regex (`parse_curl`), loops over file indices building download URLs (`create_url`), streams each file to a temp file, verifies size, renames to final name, and persists `last_downloaded_index`. `refresh_download_token()` prints manual-recapture instructions and blocks on `input()` — no subprocess/Selenium involved. |
+| `download_takeout.py` | The batch downloader — see Workflow above. Reads `secrets.json` + `curl.txt`, parses headers/cookies/`rapt` token from the curl string via regex (`parse_curl`), loops over file indices building download URLs (`create_url`), streams each file to a temp file, verifies size, then hands it to a background `MoveWorker` (moves into `output_directory` and persists `last_downloaded_index`, overlapping with the next download). `refresh_download_token()` prints manual-recapture instructions and blocks on `input()` — no subprocess/Selenium involved. |
 | `test_download_takeout.py` | `unittest` tests for `create_url()` / `parse_curl()`. |
 | `test_credentials.py` | `pytest` tests for `credentials.py`'s keyring-first/plaintext-fallback behavior. |
 | `test_configure_secrets.py` | `pytest` tests for `SecretsValidator`, including the keyring migration path and regression tests for the two bugs listed below. |
@@ -183,3 +197,17 @@ this up.
   final `shutil.move()` does, which is cheap to retry without re-downloading
   if the destination hiccups. A completed local file matching the expected
   size is detected and reused across runs instead of re-downloaded.
+- **The move into `output_directory` now runs on a background `MoveWorker`
+  thread** instead of blocking the main loop, so it overlaps with the next
+  file's download. A move failure is recorded (`MoveWorker.error()`) rather
+  than raised across threads; the main loop checks it each iteration and
+  after the loop, converts it to the same exit-1 behavior the old synchronous
+  `except OSError` block had, and always joins the worker (via
+  `finally: move_worker.close()`) before returning so the process never exits
+  mid-move. Multiple *concurrent downloads* (as opposed to backgrounding the
+  move) were considered and deliberately not implemented — see Workflow
+  step 3 above.
+- Also added `check_disk_space()` (via `shutil.disk_usage`), checked against
+  both `temp_download/` before writing and `output_directory` before
+  queuing the move, so a full disk is caught upfront with a clear message
+  instead of surfacing mid-transfer as an `OSError`.
