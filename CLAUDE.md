@@ -195,8 +195,11 @@ and reintroducing `credentials.py` for that alone wasn't judged worth it.
 ## Config / state files (all gitignored)
 
 - **`secrets.json`** — created by `configure-secrets`. Structure:
-  `google_takeout.{max_files, output_directory, download_delay}`,
-  `authentication.{last_downloaded_index}`.
+  `google_takeout.{max_files, output_directory, download_delay,
+  max_pending_moves}`, `authentication.{last_downloaded_index}`.
+  `max_pending_moves` (default 2) caps how many fully-downloaded-but-not-
+  yet-moved files can queue up in `TEMP_DIR` before the download loop
+  blocks waiting for `MoveWorker` to catch up — see "Backpressure" below.
 - **`curl.txt`** — optional legacy bootstrap only; not written by
   `refresh_download_token()` anymore — see "Session refresh" above.
 
@@ -216,6 +219,37 @@ pre-existing dependencies.
 pip install -e ".[dev]"
 pytest
 ```
+
+### Fixed in the backpressure pass (this pass)
+
+- **Sustained download rate faster than the destination's sustained write
+  rate let an unbounded backlog of fully-downloaded-but-not-yet-moved files
+  pile up in `TEMP_DIR`, with no ceiling.** Confirmed against a real run on
+  a remote server writing to a direct USB-attached HDD (~6MB/s sustained
+  download vs. ~2MB/s sustained write): `MoveWorker`'s queue was
+  unbounded (`queue.Queue()`) and `submit()` never blocked, so the main
+  loop just kept downloading as fast as the network allowed regardless of
+  whether the mover had caught up. Combined with the bug below, this meant
+  a single transient move failure could strand dozens of already-downloaded
+  files. Fixed: the queue is now bounded to `max_pending_moves` (default
+  2, configurable in `secrets.json`) — `submit()`'s existing `queue.put()`
+  already blocks once full, so a slow destination now naturally throttles
+  the download loop down to its own sustained pace instead of racing ahead
+  of it. `_run()`'s loop always calls `queue.get()` (even in the
+  post-failure skip branch), so this can't deadlock.
+- **One transient `OSError` moving a file permanently abandoned every
+  subsequent queued move for the rest of the run**, even though those files
+  were already fully downloaded and verified — plausible on a
+  directly-attached HDD under sustained large sequential writes (controller
+  stall, brief disconnect, journal flush hangup), not necessarily a dead
+  destination. Fixed: `MoveWorker._run()` now retries a failing move a few
+  times (`MOVE_RETRY_DELAYS`, short increasing backoff) before falling back
+  to the existing stop-everything-else behavior, which is still correct for
+  a genuinely unreachable destination.
+- `check_disk_space(outdir, ...)` before queuing a move now checks for
+  `max_pending_moves` files' worth of free space, not just the current one,
+  since that's the real worst-case backlog the destination may need to
+  absorb at once.
 
 ### Fixed in the session-refresh / packaging pass (this pass)
 

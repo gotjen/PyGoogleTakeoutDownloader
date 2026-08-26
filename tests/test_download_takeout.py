@@ -4,9 +4,10 @@ import base64
 import json
 import struct
 import tempfile
+import threading
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import crc32c
 
@@ -22,6 +23,8 @@ from pygoogletakeoutdownloader.download_takeout import (
     extract_rapt,
     extract_job_id,
     patch_config_field,
+    MoveWorker,
+    MOVE_RETRY_DELAYS,
 )
 
 class TestDownloader(unittest.TestCase):
@@ -208,6 +211,111 @@ class TestDownloader(unittest.TestCase):
             (outdir / 'takeout-20260101_000000Z-007.zip').touch()
             (outdir / 'not-a-takeout-file.txt').touch()
             self.assertEqual(scan_completed_indices(outdir), {0, 7})
+
+    def _make_config(self, tmp):
+        config_path = Path(tmp) / 'secrets.json'
+        config_path.write_text(json.dumps({
+            'google_takeout': {},
+            'authentication': {'last_downloaded_index': 0},
+        }))
+        return config_path
+
+    def test_move_worker_backpressure_blocks_submit_when_queue_full(self):
+        """A sustained download rate faster than the destination's write
+        rate must not be able to build an unbounded backlog: with
+        max_pending_moves=1, a third submit() has to wait for the first
+        job's (still in-progress) move to finish and free a slot."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = self._make_config(tmp)
+            first_move_release = threading.Event()
+            move_calls = []
+
+            def fake_move(src, dst):
+                move_calls.append(src)
+                if len(move_calls) == 1:
+                    self.assertTrue(first_move_release.wait(timeout=5))
+
+            with patch('pygoogletakeoutdownloader.download_takeout.shutil.move', side_effect=fake_move):
+                worker = MoveWorker(config_path, max_pending_moves=1)
+                try:
+                    worker.submit(0, 'a', 'a-out')
+                    # Worker thread immediately dequeues job 0 and blocks
+                    # inside fake_move; the queue is empty again, so this
+                    # is accepted without blocking.
+                    worker.submit(1, 'b', 'b-out')
+
+                    third_submitted = threading.Event()
+
+                    def submit_third():
+                        worker.submit(2, 'c', 'c-out')
+                        third_submitted.set()
+
+                    t = threading.Thread(target=submit_third)
+                    t.start()
+                    # Queue is full (holding job 1) while job 0's move is
+                    # still blocked on the event — submit(2) must not
+                    # return yet.
+                    self.assertFalse(third_submitted.wait(timeout=0.3))
+
+                    first_move_release.set()
+                    self.assertTrue(third_submitted.wait(timeout=5))
+                    t.join(timeout=5)
+                finally:
+                    worker.close()
+
+            self.assertEqual(move_calls, ['a', 'b', 'c'])
+            self.assertIsNone(worker.error())
+
+    def test_move_worker_retries_transient_failure_then_succeeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = self._make_config(tmp)
+            attempts = []
+
+            def flaky_move(src, dst):
+                attempts.append(src)
+                if len(attempts) < len(MOVE_RETRY_DELAYS):
+                    raise OSError("transient hiccup")
+
+            with patch('pygoogletakeoutdownloader.download_takeout.shutil.move', side_effect=flaky_move), \
+                 patch('pygoogletakeoutdownloader.download_takeout.time.sleep'):
+                worker = MoveWorker(config_path, max_pending_moves=2)
+                worker.submit(0, 'a', 'a-out')
+                worker.close()
+
+            self.assertIsNone(worker.error())
+            self.assertEqual(len(attempts), len(MOVE_RETRY_DELAYS))
+            on_disk = json.loads(config_path.read_text())
+            self.assertEqual(on_disk['authentication']['last_downloaded_index'], 1)
+
+    def test_move_worker_gives_up_after_exhausting_retries(self):
+        """A persistently unreachable destination should still trip the
+        existing stop-everything-else path once retries are exhausted, and
+        the queue must keep draining (not deadlock) for jobs submitted
+        after the error is recorded."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = self._make_config(tmp)
+            call_count = 0
+
+            def always_fails(src, dst):
+                nonlocal call_count
+                call_count += 1
+                raise OSError("destination unreachable")
+
+            with patch('pygoogletakeoutdownloader.download_takeout.shutil.move', side_effect=always_fails), \
+                 patch('pygoogletakeoutdownloader.download_takeout.time.sleep'):
+                worker = MoveWorker(config_path, max_pending_moves=2)
+                worker.submit(0, 'a', 'a-out')
+                # Must not block even though job 0 will end up failed —
+                # _run()'s skip branch still drains the queue.
+                worker.submit(1, 'b', 'b-out')
+                worker.close()
+
+            self.assertEqual(call_count, 1 + len(MOVE_RETRY_DELAYS))
+            error = worker.error()
+            self.assertIsNotNone(error)
+            self.assertEqual(error[0], 0)
+            on_disk = json.loads(config_path.read_text())
+            self.assertEqual(on_disk['authentication']['last_downloaded_index'], 0)
 
 if __name__ == '__main__':
     unittest.main()

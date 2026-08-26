@@ -273,6 +273,9 @@ def patch_config_field(config_path, section, key, value):
     with open(config_path, 'w') as f:
         json.dump(on_disk, f, indent=4)
 
+MOVE_RETRY_DELAYS = (5, 15, 30)
+
+
 class MoveWorker:
     """
     Background thread that moves verified downloads from TEMP_DIR into
@@ -280,13 +283,22 @@ class MoveWorker:
     slow, network-mounted) move overlaps with the next file's download
     instead of blocking the main loop on it.
 
+    The queue is bounded to max_pending_moves: once that many files are
+    queued/in-flight for the mover, submit() blocks until it catches up.
+    This is the only throttle on the download loop — without it, a
+    sustained download rate faster than the destination's sustained write
+    rate lets an unbounded backlog of fully-downloaded files pile up in
+    TEMP_DIR. _run()'s loop always calls queue.get() (even once self._error
+    is set, in the skip branch below), so a full queue always has a
+    consumer and submit() can never block forever.
+
     Not a daemon thread: the caller must always call close() (e.g. in a
     finally block) before exiting, since killing the process mid-move could
     leave a half-copied file at the destination.
     """
 
-    def __init__(self, config_path):
-        self._queue = queue.Queue()
+    def __init__(self, config_path, max_pending_moves=2):
+        self._queue = queue.Queue(maxsize=max_pending_moves)
         self._config_path = config_path
         self._error = None
         self._thread = threading.Thread(target=self._run)
@@ -305,17 +317,32 @@ class MoveWorker:
             # files out of order or past a failure last_downloaded_index
             # can't reflect anyway. They stay safely in TEMP_DIR.
             if self._error is None:
-                try:
-                    # shutil.move (not Path.rename) since TEMP_DIR and
-                    # outdir are commonly on different filesystems —
-                    # rename() can't cross that boundary, move() falls back
-                    # to copy+delete.
-                    shutil.move(str(tmpfile), str(outfile))
-                    patch_config_field(self._config_path, 'authentication', 'last_downloaded_index', index + 1)
-                    logging.info(f"Moved file {index} to {outfile}")
-                except OSError as e:
-                    logging.error(f"I/O error moving file {index} to {outfile}: {e}")
-                    self._error = (index, tmpfile, outfile, e)
+                last_error = None
+                for attempt, delay in enumerate((0,) + MOVE_RETRY_DELAYS):
+                    if delay:
+                        # A directly-attached HDD under sustained large
+                        # sequential writes can throw a transient OSError
+                        # (controller stall, brief disconnect, journal
+                        # flush hangup) without being permanently broken —
+                        # worth a few retries before giving up on the rest
+                        # of the run.
+                        logging.warning(f"Retrying move of file {index} in {delay}s (attempt {attempt + 1})")
+                        time.sleep(delay)
+                    try:
+                        # shutil.move (not Path.rename) since TEMP_DIR and
+                        # outdir are commonly on different filesystems —
+                        # rename() can't cross that boundary, move() falls
+                        # back to copy+delete.
+                        shutil.move(str(tmpfile), str(outfile))
+                        patch_config_field(self._config_path, 'authentication', 'last_downloaded_index', index + 1)
+                        logging.info(f"Moved file {index} to {outfile}")
+                        last_error = None
+                        break
+                    except OSError as e:
+                        logging.error(f"I/O error moving file {index} to {outfile}: {e}")
+                        last_error = e
+                if last_error is not None:
+                    self._error = (index, tmpfile, outfile, last_error)
 
     def error(self):
         """Return (index, tmpfile, outfile, exception) of the first failed
@@ -434,12 +461,18 @@ def main():
           f"filling in whatever's missing up to index {max_files - 1}.")
 
     download_delay = config['google_takeout'].get('download_delay', 5)
+    # Caps how many fully-downloaded-but-not-yet-moved files can pile up in
+    # TEMP_DIR before the main loop blocks waiting for the mover to catch
+    # up. This is what keeps a sustained download rate faster than the
+    # destination's sustained write rate from building an unbounded local
+    # backlog — see MoveWorker's docstring.
+    max_pending_moves = config['google_takeout'].get('max_pending_moves', 2)
 
     # Moves run on a background thread so the (often slow, network-mounted)
     # copy into output_directory overlaps with the next file's download
     # instead of blocking it. exit_code (rather than early `return`s) lets
     # every exit path still fall through to the `finally` that joins it.
-    move_worker = MoveWorker('secrets.json')
+    move_worker = MoveWorker('secrets.json', max_pending_moves)
     exit_code = 0
     i = start
     try:
@@ -581,7 +614,12 @@ def main():
                         raise
 
                 move_size = total_size or tmpfile.stat().st_size
-                if move_size and not check_disk_space(outdir, move_size, "output directory"):
+                # Sized for the whole possible backlog (up to
+                # max_pending_moves files queued/in-flight at once), not
+                # just this one file, so a destination nearing capacity is
+                # caught upfront instead of surfacing mid-copy as an
+                # OSError.
+                if move_size and not check_disk_space(outdir, move_size * max_pending_moves, "output directory"):
                     exit_code = 1
                     break
 
