@@ -414,10 +414,20 @@ def main():
 
             print(f"Waiting {download_delay} seconds...")
             time.sleep(download_delay)
+    except KeyboardInterrupt:
+        # A clean pause, not a crash: last_downloaded_index only ever
+        # reflects fully-moved files (MoveWorker updates it), so re-running
+        # simply resumes at the same index — nothing extra to persist here.
+        print(f"\nInterrupted — pausing before file {i}.")
+        print("Re-run to resume; already-completed files are unaffected.")
+        logging.warning(f"Interrupted by user during file {i}")
+        exit_code = 130  # conventional 128+SIGINT exit code
     finally:
         # Always join the worker, even on an early exit above: it isn't a
         # daemon thread, since letting the process die mid-move could leave
-        # a half-copied file sitting at outfile.
+        # a half-copied file sitting at outfile. This also means a Ctrl+C
+        # here waits for an in-flight move to finish rather than aborting it
+        # partway through.
         move_worker.close()
 
     if exit_code == 0:
@@ -437,6 +447,12 @@ def main():
     return exit_code
 
 if __name__ == "__main__":
-    exit(main())
+    try:
+        exit(main())
+    except KeyboardInterrupt:
+        # Catches an interrupt during setup, before main()'s own
+        # try/except KeyboardInterrupt (and its MoveWorker) even exist.
+        print("\nInterrupted before startup completed.")
+        exit(130)
 
 # Path: download_takeout.py
