@@ -77,15 +77,25 @@ for this).
 download-takeout
 ```
 
-No command-line flags — it reads `config.json`, and prompts you to paste a
-captured download session the first time it's needed (see below). On startup
-it scans `output_directory` for files it's already
-downloaded and resumes by filling in whatever's missing, from index 0
-through `google_takeout.max_files` — so if a file gets skipped for any
-reason, the next run re-fetches exactly that one rather than trusting a
-single "last completed" counter (which was, in practice, once wrong after a
-mid-batch session refresh). It waits `google_takeout.download_delay`
-seconds between files.
+It reads `config.json`, and prompts you to paste a captured download
+session the first time it's needed (see below). On startup it scans
+`output_directory` for files it's already downloaded and resumes by
+filling in whatever's missing, from index 0 through
+`google_takeout.max_files` — so if a file gets skipped for any reason, the
+next run re-fetches exactly that one rather than trusting a single "last
+completed" counter (which was, in practice, once wrong after a mid-batch
+session refresh). It waits `google_takeout.download_delay` seconds between
+files it actually downloads (a file found already complete in the local
+staging directory is queued for the move immediately, with no wait).
+
+Pass `--verify` to also re-check every file already in `output_directory`
+against Google's CRC32C for that index before downloading anything new (no
+re-download of the body — just a header check). Any mismatch is deleted so
+the normal resume pass above re-fetches it:
+
+```bash
+download-takeout --verify
+```
 
 Each file is downloaded into a local staging directory in your system's temp
 folder (a stable, fixed-name subdirectory under `tempfile.gettempdir()`,

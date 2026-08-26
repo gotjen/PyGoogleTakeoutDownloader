@@ -19,6 +19,8 @@ from pygoogletakeoutdownloader.download_takeout import (
     parse_expected_crc32c,
     compute_file_crc32c,
     scan_completed_indices,
+    list_completed_files,
+    verify_destination,
     AuthState,
     extract_rapt,
     extract_job_id,
@@ -26,6 +28,11 @@ from pygoogletakeoutdownloader.download_takeout import (
     MoveWorker,
     MOVE_RETRY_DELAYS,
 )
+
+def _crc_header(data):
+    """x-goog-hash-style header for the CRC32C of `data`, for mocking a
+    verify_destination() response."""
+    return f"crc32c={base64.b64encode(struct.pack('>I', crc32c.crc32c(data))).decode()}"
 
 class TestDownloader(unittest.TestCase):
     def test_working_url_format(self):
@@ -211,6 +218,96 @@ class TestDownloader(unittest.TestCase):
             (outdir / 'takeout-20260101_000000Z-007.zip').touch()
             (outdir / 'not-a-takeout-file.txt').touch()
             self.assertEqual(scan_completed_indices(outdir), {0, 7})
+
+    def test_list_completed_files_maps_index_to_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outdir = Path(tmp)
+            f0 = outdir / 'takeout-20260101_000000Z-000.zip'
+            f7 = outdir / 'takeout-20260101_000000Z-007.zip'
+            f0.touch()
+            f7.touch()
+            (outdir / 'not-a-takeout-file.txt').touch()
+            self.assertEqual(list_completed_files(outdir), {0: f0, 7: f7})
+
+    def test_verify_destination_all_ok(self):
+        """A file whose recomputed CRC32C matches Google's header for that
+        index should be left alone and reported 'ok'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            outdir = Path(tmp)
+            data = b'hello world'
+            path = outdir / 'takeout-20260101_000000Z-000.zip'
+            path.write_bytes(data)
+
+            response = MagicMock()
+            response.status_code = 200
+            response.headers = {'content-type': 'application/zip', 'x-goog-hash': _crc_header(data)}
+            session = MagicMock()
+            session.get.return_value = response
+
+            status, rapt, job_id = verify_destination(session, outdir, 'rapt', 'job')
+
+            self.assertEqual(status, 'ok')
+            self.assertEqual((rapt, job_id), ('rapt', 'job'))
+            response.close.assert_called_once()
+            self.assertTrue(path.exists())
+
+    def test_verify_destination_mismatch_deletes_file(self):
+        """A stored file that no longer matches Google's checksum (e.g.
+        silent corruption on a flaky mount) must be deleted so the normal
+        resume pass re-fetches it — same remediation used everywhere else
+        in this file on a checksum mismatch."""
+        with tempfile.TemporaryDirectory() as tmp:
+            outdir = Path(tmp)
+            path = outdir / 'takeout-20260101_000000Z-000.zip'
+            path.write_bytes(b'actual bytes on disk')
+
+            response = MagicMock()
+            response.status_code = 200
+            response.headers = {'content-type': 'application/zip', 'x-goog-hash': _crc_header(b'different expected bytes')}
+            session = MagicMock()
+            session.get.return_value = response
+
+            status, _, _ = verify_destination(session, outdir, 'rapt', 'job')
+
+            self.assertEqual(status, 'refetching')
+            self.assertFalse(path.exists())
+
+    def test_verify_destination_404_skipped_without_flagging(self):
+        """Google 404ing an already-downloaded index (e.g. a different
+        export's job_id) isn't corruption — leave the file alone and don't
+        report it as a mismatch."""
+        with tempfile.TemporaryDirectory() as tmp:
+            outdir = Path(tmp)
+            path = outdir / 'takeout-20260101_000000Z-000.zip'
+            path.write_bytes(b'data')
+
+            response = MagicMock()
+            response.status_code = 404
+            session = MagicMock()
+            session.get.return_value = response
+
+            status, _, _ = verify_destination(session, outdir, 'rapt', 'job')
+
+            self.assertEqual(status, 'ok')
+            self.assertTrue(path.exists())
+
+    def test_verify_destination_aborts_when_refresh_fails(self):
+        """A stale session that can't be refreshed should stop verification
+        rather than looping or crashing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            outdir = Path(tmp)
+            (outdir / 'takeout-20260101_000000Z-000.zip').write_bytes(b'data')
+
+            response = MagicMock()
+            response.status_code = 500
+            response.headers = {'content-type': 'text/html'}
+            session = MagicMock()
+            session.get.return_value = response
+
+            with patch('pygoogletakeoutdownloader.download_takeout.refresh_download_token', return_value=None):
+                status, _, _ = verify_destination(session, outdir, 'rapt', 'job')
+
+            self.assertEqual(status, 'aborted')
 
     def _make_config(self, tmp):
         config_path = Path(tmp) / 'config.json'

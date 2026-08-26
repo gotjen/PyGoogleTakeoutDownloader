@@ -28,9 +28,9 @@ Workflow (see README.md's "Workflow" section for the full walkthrough):
    size against `Content-Length` and checksum against the `x-goog-hash`
    response header (see "CRC32C verification" below), then handing the
    verified file to a background `MoveWorker` thread that `shutil.move`s it
-   into the configured `output_directory`. It takes **no command-line
-   arguments** — everything comes from `config.json` and the pasted curl
-   capture.
+   into the configured `output_directory`. Everything else comes from
+   `config.json` and the pasted curl capture — the only command-line flag
+   is `--verify` (see below).
    - **Resume is scan-based, not counter-based:** on startup, `main()` calls
      `scan_completed_indices(outdir)` to find which `...-{index:03d}.zip`
      files already exist, then always loops from index 0, skipping (with no
@@ -46,7 +46,9 @@ Workflow (see README.md's "Workflow" section for the full walkthrough):
      token-consuming) file from Google. A completed `*.part` file (in the
      staging directory, under a stable per-index name) matching the
      expected size is detected and reused on the next run instead of
-     re-downloading.
+     re-downloading — and since no bytes were actually transferred in that
+     case, `download_delay` is skipped for that index (it exists to
+     throttle real downloads, not header-only requests).
    - **Why the move is backgrounded:** the move into `output_directory` is
      the slow, network-bound half of each file (the download into the local
      staging directory is the other half); running it on a `MoveWorker`
@@ -141,6 +143,26 @@ is deleted and the run halts, so the next run's outdir scan (above) picks
 it back up. `md5=` may also appear in the header for some responses but
 isn't used — `crc32c` is always present in what's been observed so far.
 
+### Verifying already-downloaded files (`--verify`)
+
+The CRC32C check above only runs at download time — it can't catch
+corruption introduced afterward (e.g. a bad move onto a flaky mount, or
+bitrot on the destination). `download-takeout --verify` re-checks every
+file already in `output_directory` before downloading anything new:
+`verify_destination()` opens the same authenticated download URL per index
+with `stream=True`, reads just the `x-goog-hash` header, and `close()`s the
+response *without pulling any body bytes* — the identical trick `main()`'s
+loop already uses to check a reused local copy in TEMP_DIR (see "Why stage
+locally first" above), just pointed at `output_directory` instead. A
+mismatch is deleted (same remediation as every other checksum failure in
+this file), so the normal scan-based resume pass that follows re-fetches it
+in the same run. A 404 for an already-downloaded index (e.g. a different
+export's `job_id`) is treated as unverifiable, not corrupt — the file is
+left alone. A session that's gone stale mid-verification is refreshed the
+same way the main loop refreshes it; if that refresh fails/is aborted,
+verification stops and `main()` exits 1 rather than silently skipping the
+remaining files.
+
 ## Layout
 
 A packaged project (`pyproject.toml`, `src/` layout), not flat scripts:
@@ -168,7 +190,7 @@ the `if __name__ == "__main__":` block would otherwise get it).
 
 | File | Purpose |
 |---|---|
-| `download_takeout.py` | The batch downloader — see Workflow above. Reads `config.json`, applies an `AuthState` (headers/cookies/`rapt`/`job_id` — from a pasted curl paste or the optional legacy `curl.txt`) to a `requests.Session` via `apply_auth_state()`, scans `output_directory` for already-completed indices (`scan_completed_indices`), loops from 0 skipping those, builds download URLs (`create_url`), streams each file to a temp file, verifies size and CRC32C (`parse_expected_crc32c`/`compute_file_crc32c`), then hands it to a background `MoveWorker` (moves into `output_directory`, overlapping with the next download). `refresh_download_token()` prompts for a pasted curl command directly — see "Session refresh" above. `patch_config_field()` does a narrow read-modify-write of one `config.json` field (used by `MoveWorker` for `last_downloaded_index`), rather than re-dumping a possibly-stale in-memory config snapshot that could revert a concurrent edit. |
+| `download_takeout.py` | The batch downloader — see Workflow above. Reads `config.json`, applies an `AuthState` (headers/cookies/`rapt`/`job_id` — from a pasted curl paste or the optional legacy `curl.txt`) to a `requests.Session` via `apply_auth_state()`; with `--verify`, first calls `verify_destination()` to re-check every file already in `output_directory` (see "Verifying already-downloaded files" above); scans `output_directory` for already-completed indices (`scan_completed_indices`/`list_completed_files`), loops from 0 skipping those, builds download URLs (`create_url`), streams each file to a temp file, verifies size and CRC32C (`parse_expected_crc32c`/`compute_file_crc32c`), then hands it to a background `MoveWorker` (moves into `output_directory`, overlapping with the next download). `refresh_download_token()` prompts for a pasted curl command directly — see "Session refresh" above. `patch_config_field()` does a narrow read-modify-write of one `config.json` field (used by `MoveWorker` for `last_downloaded_index`), rather than re-dumping a possibly-stale in-memory config snapshot that could revert a concurrent edit. |
 | `configure.py` | Interactive wizard (`ConfigValidator`). Loads/creates `config.json`, validates and prompts for `output_directory`/`download_delay`/`max_files`. No credential storage — see "Removed: credential storage" below. |
 | `test_download_takeout.py` | `unittest` tests for `create_url()`, `parse_curl()`, `AuthState`, `extract_rapt()`/`extract_job_id()`, `patch_config_field()`, `parse_expected_crc32c()`, `compute_file_crc32c()`, `scan_completed_indices()`. |
 | `test_configure.py` | `pytest` tests for `ConfigValidator`'s config validation/defaults. |
@@ -219,6 +241,19 @@ pre-existing dependencies.
 pip install -e ".[dev]"
 pytest
 ```
+
+### Added `--verify` and skipped the delay on a reused local copy (this pass)
+
+- **`download-takeout --verify`** re-checks every file already in
+  `output_directory` against Google's CRC32C for that index before
+  downloading anything new, without re-downloading any file body — see
+  "Verifying already-downloaded files" above. A mismatch is deleted so the
+  normal resume pass re-fetches it in the same run.
+- **`download_delay` no longer applies when a file was found already
+  complete in TEMP_DIR** (the "found complete local copy, skipping
+  re-download" path) — that case never actually transfers any file bytes,
+  so there's nothing to throttle. Delay still applies after every real
+  download.
 
 ### Renamed: secrets.json/configure_secrets.py → config.json/configure.py
 

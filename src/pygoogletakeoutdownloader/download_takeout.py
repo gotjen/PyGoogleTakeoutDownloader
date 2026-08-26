@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import requests
 import os
 import shutil
@@ -166,6 +167,20 @@ def describe_error_response(response, max_body_chars=500):
 
 OUTFILE_INDEX_RE = re.compile(r'-(\d{3})\.zip$')
 
+def list_completed_files(outdir):
+    """
+    Return {index: path} for every file in outdir matching outfile's
+    `...-{index:03d}.zip` naming scheme — like scan_completed_indices()
+    below, but keeping the path (needed to re-verify a specific file)
+    instead of discarding it.
+    """
+    files = {}
+    for path in outdir.glob('*.zip'):
+        m = OUTFILE_INDEX_RE.search(path.name)
+        if m:
+            files[int(m.group(1))] = path
+    return files
+
 def scan_completed_indices(outdir):
     """
     Return the set of file indices already present in outdir, parsed from
@@ -176,12 +191,7 @@ def scan_completed_indices(outdir):
     what's missing instead of trusting last_downloaded_index alone, which
     has already been observed to advance past a skipped file.
     """
-    indices = set()
-    for path in outdir.glob('*.zip'):
-        m = OUTFILE_INDEX_RE.search(path.name)
-        if m:
-            indices.add(int(m.group(1)))
-    return indices
+    return set(list_completed_files(outdir))
 
 def parse_expected_crc32c(x_goog_hash_header):
     """
@@ -398,7 +408,83 @@ def load_curl_state(session):
         auth = parse_curl(f.read())
     return apply_auth_state(session, auth)
 
-def main():
+def verify_destination(session, outdir, rapt, job_id):
+    """
+    Re-check every already-downloaded file in outdir against Google's
+    x-goog-hash for that index, without re-downloading the body — same
+    trick main()'s loop uses to verify a reused local copy in TEMP_DIR
+    (open the download URL with stream=True, read the header, close()
+    before any body bytes are pulled), just pointed at output_directory.
+
+    A mismatch means silent corruption (e.g. a bad move to a flaky mount)
+    slipped past the checks done at download time — the file is deleted so
+    the caller's normal resume pass re-fetches it, the same remediation
+    used everywhere else in this file when a checksum doesn't match.
+
+    :return: (status, rapt, job_id) where status is 'ok' (everything
+        verified, nothing to fix), 'refetching' (one or more mismatches
+        were found and deleted — the caller's normal loop will refetch
+        them), or 'aborted' (a stale session couldn't be refreshed, so
+        verification stopped partway through).
+    """
+    files = list_completed_files(outdir)
+    print(f"Verifying {len(files)} file(s) in {outdir}...")
+
+    found_mismatch = False
+    for index, path in sorted(files.items()):
+        response = None
+        while True:
+            url = create_url(index, job_id, rapt)
+            candidate = session.get(url, stream=True)
+
+            if candidate.status_code == 404:
+                print(f"  {path.name}: file {index} not found on Google's side (skipping)")
+                candidate.close()
+                break
+
+            if candidate.status_code == 200 and 'html' not in candidate.headers.get('content-type', ''):
+                response = candidate
+                break
+
+            candidate.close()
+            print(f"  Request failed for file {index} (HTTP {candidate.status_code}) — refreshing session.")
+            auth = refresh_download_token()
+            if auth is None:
+                print("Failed to refresh download token — aborting verification")
+                return 'aborted', rapt, job_id
+            rapt, job_id = apply_auth_state(session, auth)
+
+        if response is None:
+            continue  # 404 above — nothing to compare against
+
+        expected_crc32c = parse_expected_crc32c(response.headers.get('x-goog-hash'))
+        response.close()
+
+        if expected_crc32c is None:
+            print(f"  {path.name}: no crc32c available from server, skipping")
+            continue
+
+        actual_crc32c = compute_file_crc32c(path)
+        if actual_crc32c == expected_crc32c:
+            print(f"  {path.name}: OK")
+        else:
+            print(f"  {path.name}: CRC32C MISMATCH (expected {expected_crc32c}, got {actual_crc32c}) — deleting, will re-download")
+            logging.error(f"CRC32C mismatch verifying {path} (index {index}): expected {expected_crc32c}, got {actual_crc32c}")
+            _safe_unlink(path)
+            found_mismatch = True
+
+    return ('refetching' if found_mismatch else 'ok'), rapt, job_id
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Batch-download a Google Takeout export.")
+    parser.add_argument(
+        '--verify', action='store_true',
+        help="Before downloading anything new, re-check every file already "
+             "in output_directory against Google's CRC32C for that index "
+             "(no re-download of the body) and delete/re-fetch any mismatch.",
+    )
+    args = parser.parse_args(argv)
+
     # Configure logging
     logging.basicConfig(
         level=logging.INFO,
@@ -446,6 +532,13 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
+    if args.verify:
+        status, rapt, job_id = verify_destination(session, outdir, rapt, job_id)
+        if status == 'aborted':
+            return 1
+        # 'refetching' files were already deleted above — the scan below
+        # naturally picks them back up as missing, same as any other gap.
+
     # Resume point comes entirely from what's actually in outdir, not from
     # last_downloaded_index: a past bug demonstrated that counter can
     # advance past a file that was silently skipped, permanently hiding the
@@ -491,6 +584,7 @@ def main():
                 continue
 
             print(f"\nDownloading file {i}...")
+            used_local_copy = False
 
             url = create_url(i, job_id, rapt)
             try:
@@ -555,6 +649,7 @@ def main():
                     # and move on.
                     print(f"Found complete local copy at {tmpfile}, skipping re-download")
                     response.close()
+                    used_local_copy = True
                     if expected_crc32c is not None and compute_file_crc32c(tmpfile) != expected_crc32c:
                         print("Error: CRC32C mismatch on existing local copy")
                         _safe_unlink(tmpfile)
@@ -635,8 +730,15 @@ def main():
                 exit_code = 1
                 break
 
-            print(f"Waiting {download_delay} seconds...")
-            time.sleep(download_delay)
+            # download_delay throttles actual downloads to look human — a
+            # reused local copy didn't transfer any file bytes, so there's
+            # nothing to throttle and no reason to wait before the next
+            # index.
+            if used_local_copy:
+                print("Local copy reused — skipping download delay")
+            else:
+                print(f"Waiting {download_delay} seconds...")
+                time.sleep(download_delay)
             # Only reached after a real success — every retry/refresh path
             # above hits `continue` before this, and every fatal path hits
             # `break`. This is what makes retrying file i (rather than
