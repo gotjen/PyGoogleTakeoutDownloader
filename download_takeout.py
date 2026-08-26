@@ -10,17 +10,23 @@ import re
 import base64
 import struct
 import crc32c
+import tempfile
+from tqdm import tqdm
 from pathlib import Path
 from datetime import datetime
 import json
 import logging
 
 # Files are downloaded here first, then moved to the configured
-# output_directory once complete. Keeping this local (and gitignored) means
-# the slow, expensive part — streaming a many-GB file from Google — never
-# touches a potentially flaky network/FUSE-mounted destination; only the
-# final move does, and that's cheap to retry without re-downloading.
-TEMP_DIR = Path(__file__).resolve().parent / 'temp_download'
+# output_directory once complete. Staging in the OS temp dir (a stable,
+# fixed-name subdirectory, not a fresh mkdtemp() per run) means the slow,
+# expensive part — streaming a many-GB file from Google — never touches a
+# potentially flaky network/FUSE-mounted destination; only the final move
+# does, and that's cheap to retry without re-downloading. Keeping the name
+# stable also means a completed-but-unmoved .part file from a prior run is
+# still found and reused (see the tmpfile.exists() check below) instead of
+# re-downloaded.
+TEMP_DIR = Path(tempfile.gettempdir()) / 'pygoogletakeoutdownloader'
 
 def refresh_download_token():
     """
@@ -182,8 +188,8 @@ def check_disk_space(path, required_bytes, label):
     Verify at least `required_bytes` is free on the filesystem backing `path`.
 
     Uses shutil.disk_usage (the `df`-equivalent) rather than shelling out to
-    `df`. TEMP_DIR and output_directory are commonly on different
-    filesystems (see module docstring), and a many-GB Takeout file is
+    `df`. TEMP_DIR (OS temp dir) and output_directory are commonly on
+    different filesystems (see module docstring), and a many-GB Takeout file is
     expensive enough to fetch that running out of space mid-stream/mid-move
     should be caught upfront rather than discovered as an OSError partway
     through.
@@ -307,7 +313,7 @@ def load_curl_state(session):
 def main():
     # Configure logging
     logging.basicConfig(
-        level=logging.INFO, 
+        level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
 
@@ -472,7 +478,14 @@ def main():
                     print(f"Saving to {tmpfile}")
                     try:
                         crc = 0
-                        with open(tmpfile, 'wb') as f:
+                        with open(tmpfile, 'wb') as f, tqdm(
+                            total=total_size or None,
+                            unit='B',
+                            unit_scale=True,
+                            unit_divisor=1024,
+                            desc=f"File {i:03d}",
+                            colour='green',
+                        ) as pbar:
                             # 4 MiB chunks: at the default 8 KiB, a single
                             # large (tens-of-GB) Takeout file means millions
                             # of Python-level iterations for no benefit.
@@ -480,6 +493,7 @@ def main():
                                 if chunk:
                                     f.write(chunk)
                                     crc = crc32c.crc32c(chunk, crc)
+                                    pbar.update(len(chunk))
 
                         # Verify size if we got content-length
                         if total_size and tmpfile.stat().st_size != total_size:
@@ -496,7 +510,7 @@ def main():
 
                     except OSError as e:
                         # A genuinely local disk problem (out of space,
-                        # etc) — TEMP_DIR lives in the repo, not on a
+                        # etc) — TEMP_DIR lives in the OS temp dir, not on a
                         # network mount, so this is unlikely but still
                         # shouldn't crash the script.
                         print(f"Error: I/O error writing local temp file {tmpfile}: {e}")

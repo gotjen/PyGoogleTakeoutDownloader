@@ -96,21 +96,23 @@ single "last completed" counter (which was, in practice, once wrong after a
 mid-batch session refresh). It waits `google_takeout.download_delay`
 seconds between files.
 
-Each file is downloaded into a local, gitignored `temp_download/` directory
-in the repo first, verified against `Content-Length` and against the
-CRC32C checksum Google's server returns (`x-goog-hash` header), and only
-then moved into your configured `output_directory`. This matters if that
-directory is a network/cloud-mounted drive (e.g. rclone) — the slow,
-expensive download never touches it directly, only the final move does, so
-a flaky mount only costs a retried move, not a redownload. If a run is
-interrupted after the download but before the move, re-running detects the
-completed file in `temp_download/` and reuses it (re-verifying its
-checksum) instead of downloading again.
+Each file is downloaded into a local staging directory in your system's temp
+folder (a stable, fixed-name subdirectory under `tempfile.gettempdir()`,
+e.g. `/tmp/pygoogletakeoutdownloader` on Linux) first, verified against
+`Content-Length` and against the CRC32C checksum Google's server returns
+(`x-goog-hash` header), and only then moved into your configured
+`output_directory`. This matters if that directory is a network/cloud-mounted
+drive (e.g. rclone) — the slow, expensive download never touches it
+directly, only the final move does, so a flaky mount only costs a retried
+move, not a redownload. If a run is interrupted after the download but
+before the move, re-running detects the completed file in the staging
+directory and reuses it (re-verifying its checksum) instead of downloading
+again.
 
 That move runs on a background thread, so it overlaps with the next file's
 download instead of blocking it — files are still moved strictly in order.
-Before writing or moving a file, the script also checks that both
-`temp_download/` and `output_directory` have enough free space, failing
+Before writing or moving a file, the script also checks that both the
+staging directory and `output_directory` have enough free space, failing
 fast with a clear message rather than partway through a large transfer.
 
 ### 4. When the session goes stale

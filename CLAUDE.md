@@ -19,8 +19,8 @@ Workflow (see README.md's "Workflow" section for the full walkthrough):
    Takeout download request). There is no automated login step — see
    "Why capture is manual" below.
 3. `download_takeout.py` replays that captured request with an incrementing
-   file index (`requests`), streaming each Takeout zip into the local,
-   gitignored `temp_download/` directory (inside the repo) first, verifying
+   file index (`requests`), streaming each Takeout zip into a local staging
+   directory in the system temp folder first, verifying
    size against `Content-Length` and checksum against the `x-goog-hash`
    response header (see "CRC32C verification" below), then handing the
    verified file to a background `MoveWorker` thread that `shutil.move`s it
@@ -38,12 +38,13 @@ Workflow (see README.md's "Workflow" section for the full walkthrough):
      throw transient `OSError`s under a sustained many-GB write. Downloading
      to local disk first means that failure mode only ever costs a retry of
      the (cheap) move, never a re-download of the (expensive,
-     token-consuming) file from Google. A completed `temp_download/*.part`
-     file matching the expected size is detected and reused on the next run
-     instead of re-downloading.
+     token-consuming) file from Google. A completed `*.part` file (in the
+     staging directory, under a stable per-index name) matching the
+     expected size is detected and reused on the next run instead of
+     re-downloading.
    - **Why the move is backgrounded:** the move into `output_directory` is
-     the slow, network-bound half of each file (the download into local
-     `temp_download/` is the other half); running it on a `MoveWorker`
+     the slow, network-bound half of each file (the download into the local
+     staging directory is the other half); running it on a `MoveWorker`
      thread lets the next file's download start immediately instead of
      blocking on it. The main loop checks `MoveWorker.error()` at the top of
      each iteration and after the loop, and always joins the worker (even on
@@ -213,8 +214,10 @@ this up.
   are logged, not raised. Also bumped `iter_content`'s chunk size from 8 KiB
   to 4 MiB — at 8 KiB a single 50+ GB file is millions of Python-level
   iterations for no benefit.
-- **Downloads now stage in a local `temp_download/` directory before moving
-  to `output_directory`**, so the slow/expensive part (streaming from
+- **Downloads now stage in a local directory before moving
+  to `output_directory`** (originally a repo-local `temp_download/`, later
+  moved to a stable subdirectory under the system temp folder — see
+  Workflow step 3 above), so the slow/expensive part (streaming from
   Google) never touches a remote-mounted destination directly — only the
   final `shutil.move()` does, which is cheap to retry without re-downloading
   if the destination hiccups. A completed local file matching the expected
@@ -230,9 +233,9 @@ this up.
   move) were considered and deliberately not implemented — see Workflow
   step 3 above.
 - Also added `check_disk_space()` (via `shutil.disk_usage`), checked against
-  both `temp_download/` before writing and `output_directory` before
-  queuing the move, so a full disk is caught upfront with a clear message
-  instead of surfacing mid-transfer as an `OSError`.
+  both the local staging directory before writing and `output_directory`
+  before queuing the move, so a full disk is caught upfront with a clear
+  message instead of surfacing mid-transfer as an `OSError`.
 - **A stale-session token refresh silently skipped the failed file instead
   of retrying it, and the loss was permanent.** Confirmed against a real
   run: file 6 hit the HTML-auth-failure path, `refresh_download_token()`
@@ -254,3 +257,12 @@ this up.
   header (see "CRC32C verification" above) — size matching alone can't
   catch a same-size corruption, and this closes that gap using data Google
   already sends on every response.
+- **Local staging moved out of the repo, into the system temp dir.** The
+  staging directory (`TEMP_DIR` in `download_takeout.py`) used to be
+  `<repo>/temp_download/`; it's now `tempfile.gettempdir() /
+  'pygoogletakeoutdownloader'` (e.g. `/tmp/pygoogletakeoutdownloader` on
+  Linux). Kept as a stable, fixed-name directory (not a fresh
+  `tempfile.mkdtemp()` per run) specifically so the existing crash-resume
+  behavior — a `.part` file that finished downloading but never got moved
+  is detected and reused, re-verified via CRC32C, on the next run — still
+  works.
