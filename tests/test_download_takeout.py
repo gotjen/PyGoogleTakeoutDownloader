@@ -309,6 +309,32 @@ class TestDownloader(unittest.TestCase):
 
             self.assertEqual(status, 'aborted')
 
+    def test_verify_destination_gives_up_after_repeated_non_file_response(self):
+        """Re-requesting an already-downloaded index can hit a persistent
+        200-but-not-the-file response (e.g. an interstitial) that a fresh
+        curl paste won't fix — this must give up on just that file after a
+        bounded number of refreshes instead of demanding pastes forever."""
+        with tempfile.TemporaryDirectory() as tmp:
+            outdir = Path(tmp)
+            path = outdir / 'takeout-20260101_000000Z-000.zip'
+            path.write_bytes(b'data')
+
+            response = MagicMock()
+            response.status_code = 200
+            response.headers = {'content-type': 'text/html'}
+            response.text = '<html>not the file</html>'
+            session = MagicMock()
+            session.get.return_value = response
+
+            refreshed_auth = AuthState({}, {}, 'new-rapt', 'new-job')
+            with patch('pygoogletakeoutdownloader.download_takeout.refresh_download_token', return_value=refreshed_auth) as mock_refresh:
+                status, rapt, job_id = verify_destination(session, outdir, 'rapt', 'job')
+
+            self.assertEqual(status, 'ok')  # gave up, not a confirmed mismatch
+            self.assertTrue(path.exists())  # left alone, not deleted
+            self.assertEqual(mock_refresh.call_count, 2)  # bounded, not infinite
+            self.assertEqual((rapt, job_id), ('new-rapt', 'new-job'))
+
     def _make_config(self, tmp):
         config_path = Path(tmp) / 'config.json'
         config_path.write_text(json.dumps({

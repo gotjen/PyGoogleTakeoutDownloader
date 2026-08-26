@@ -163,6 +163,20 @@ same way the main loop refreshes it; if that refresh fails/is aborted,
 verification stops and `main()` exits 1 rather than silently skipping the
 remaining files.
 
+Re-requesting an index that's already been fully downloaded (possibly
+under an earlier, different session) is different territory than the main
+loop, which only ever requests indices it hasn't seen yet — confirmed in
+practice: Google can respond to a repeat request with a 200 that isn't the
+file (some interstitial), which looks identical to a stale session but
+isn't fixed by pasting a fresh curl. So a per-file refresh attempt is
+capped (`MAX_REFRESH_ATTEMPTS_PER_FILE`, 2); once exhausted, that one file
+is left alone (not deleted — it's unverified, not confirmed corrupt) and
+verification moves on, instead of demanding an endless string of re-pastes
+for a file a fresh session can't unstick. The actual response detail
+(status/content-type/body snippet, via `describe_error_response()`) is
+printed directly rather than only `logging.debug()`'d, since `main()`'s
+default log level (INFO) makes debug-level log lines invisible.
+
 ## Layout
 
 A packaged project (`pyproject.toml`, `src/` layout), not flat scripts:
@@ -241,6 +255,21 @@ pre-existing dependencies.
 pip install -e ".[dev]"
 pytest
 ```
+
+### Fixed: `--verify` looping forever on a persistent non-file 200 (this pass)
+
+- **`--verify` could demand an endless string of fresh curl pastes for a
+  single file.** Confirmed against a real run: re-requesting index 0 (an
+  already-downloaded file) returned a 200 whose content-type contained
+  `html` — indistinguishable, in the old code, from a stale session — and
+  the loop refreshed and retried the *same* index forever, with only
+  `Request failed for file 0 (HTTP 200) — refreshing session.` printed each
+  time (no detail on what was actually returned). Fixed: the actual
+  response (status/content-type/body snippet) is now printed via
+  `describe_error_response()`, and each file gets at most
+  `MAX_REFRESH_ATTEMPTS_PER_FILE` (2) refresh attempts before verification
+  gives up on that one file (leaving it alone, not deleting it — it's
+  unverified, not confirmed corrupt) and moves on to the rest.
 
 ### Added `--verify` and skipped the delay on a reused local copy (this pass)
 

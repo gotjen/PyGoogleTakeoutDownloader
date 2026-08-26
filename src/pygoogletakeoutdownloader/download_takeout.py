@@ -427,12 +427,23 @@ def verify_destination(session, outdir, rapt, job_id):
         them), or 'aborted' (a stale session couldn't be refreshed, so
         verification stopped partway through).
     """
+    # Re-requesting an index already fully downloaded (possibly under a
+    # different, earlier session) is untested territory compared to the
+    # main loop, which only ever requests indices it hasn't seen yet — if
+    # Google responds differently to a repeat request (e.g. some
+    # re-download interstitial) a fresh curl paste won't fix it, so this
+    # caps how many times one file can demand a re-paste before verify
+    # gives up on just that file and moves on, rather than holding the
+    # whole run hostage.
+    MAX_REFRESH_ATTEMPTS_PER_FILE = 2
+
     files = list_completed_files(outdir)
     print(f"Verifying {len(files)} file(s) in {outdir}...")
 
     found_mismatch = False
     for index, path in sorted(files.items()):
         response = None
+        refresh_attempts = 0
         while True:
             url = create_url(index, job_id, rapt)
             candidate = session.get(url, stream=True)
@@ -446,7 +457,21 @@ def verify_destination(session, outdir, rapt, job_id):
                 response = candidate
                 break
 
+            # Non-200, or a 200 that isn't the file (e.g. a sign-in page).
+            # logging.debug() is invisible at main()'s default INFO level,
+            # so print the actual detail here instead of hiding it —
+            # unlike the main loop's equivalent case, this one is uncommon
+            # enough to be worth surfacing rather than assuming it's
+            # always a stale session.
+            print(f"  {describe_error_response(candidate)}")
             candidate.close()
+
+            refresh_attempts += 1
+            if refresh_attempts > MAX_REFRESH_ATTEMPTS_PER_FILE:
+                print(f"  {path.name}: still not getting the file after {refresh_attempts - 1} "
+                      "session refresh(es) — leaving it alone, skipping")
+                break
+
             print(f"  Request failed for file {index} (HTTP {candidate.status_code}) — refreshing session.")
             auth = refresh_download_token()
             if auth is None:
@@ -455,7 +480,7 @@ def verify_destination(session, outdir, rapt, job_id):
             rapt, job_id = apply_auth_state(session, auth)
 
         if response is None:
-            continue  # 404 above — nothing to compare against
+            continue  # 404, or gave up above — nothing to compare against
 
         expected_crc32c = parse_expected_crc32c(response.headers.get('x-goog-hash'))
         response.close()
