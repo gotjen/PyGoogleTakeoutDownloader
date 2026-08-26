@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import base64
+import json
 import struct
 import tempfile
 import unittest
@@ -17,6 +18,10 @@ from download_takeout import (
     parse_expected_crc32c,
     compute_file_crc32c,
     scan_completed_indices,
+    AuthState,
+    extract_rapt,
+    extract_job_id,
+    patch_config_field,
 )
 
 class TestDownloader(unittest.TestCase):
@@ -64,6 +69,34 @@ class TestDownloader(unittest.TestCase):
         headers, cookies, rapt, job_id = parse_curl(curl)
         self.assertEqual(cookies, {'a': '1'})
         self.assertEqual(job_id, '123')
+
+    def test_parse_curl_returns_auth_state(self):
+        """parse_curl() returns an AuthState (tuple-unpackable, but also
+        accessible by field) — used by both the manual curl.txt path and
+        browser_capture.py's CDP auto-capture path."""
+        curl = """curl 'https://takeout.google.com/settings/takeout/download?j=123&rapt=test' -b 'a=1'"""
+        auth = parse_curl(curl)
+        self.assertIsInstance(auth, AuthState)
+        self.assertEqual(auth.rapt, 'test')
+        self.assertEqual(auth.job_id, '123')
+        self.assertEqual(auth.cookies, {'a': '1'})
+
+    def test_extract_rapt_and_job_id_from_page_url(self):
+        """browser_capture.py extracts rapt/job_id from a captured page URL
+        (e.g. the archive management page after a refresh) using these same
+        helpers parse_curl() uses, so both paths stay in sync."""
+        url = (
+            "https://takeout.google.com/manage/archive/8c5a1cd4-06b7?"
+            "user=12345&rapt=AEjHL4abc"
+        )
+        self.assertEqual(extract_rapt(url), 'AEjHL4abc')
+
+        download_url = "https://takeout.google.com/takeout/download?j=8c5a1cd4-06b7&i=2&rapt=AEjHL4abc"
+        self.assertEqual(extract_job_id(download_url), '8c5a1cd4-06b7')
+
+    def test_extract_rapt_missing_raises(self):
+        with self.assertRaises(ValueError):
+            extract_rapt("https://takeout.google.com/manage/archive/123")
 
     def test_describe_error_response_includes_status_and_body(self):
         """Failure diagnostics should surface the response body, not just the status code."""
@@ -145,6 +178,28 @@ class TestDownloader(unittest.TestCase):
             f.write(data)
             f.flush()
             self.assertEqual(compute_file_crc32c(f.name, chunk_size=1024), expected)
+
+    def test_patch_config_field_preserves_concurrent_edits(self):
+        """MoveWorker (and refresh_download_token()'s job_id persistence)
+        must not clobber a field added to secrets.json by someone/something
+        else after the current process's own config was loaded into memory
+        — confirmed in practice: a long-running invocation's stale
+        in-memory config silently reverted a cdp_url added mid-run when
+        MoveWorker used to re-dump its whole constructor-time snapshot."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'secrets.json'
+            path.write_text(json.dumps({
+                'google_takeout': {'cdp_url': 'http://127.0.0.1:9222'},
+                'authentication': {'last_downloaded_index': 5},
+            }))
+
+            # Simulates a concurrent edit landing on disk after this
+            # process's own (now-stale) in-memory config was loaded.
+            patch_config_field(path, 'authentication', 'last_downloaded_index', 6)
+
+            on_disk = json.loads(path.read_text())
+        self.assertEqual(on_disk['authentication']['last_downloaded_index'], 6)
+        self.assertEqual(on_disk['google_takeout']['cdp_url'], 'http://127.0.0.1:9222')
 
     def test_scan_completed_indices(self):
         with tempfile.TemporaryDirectory() as tmp:

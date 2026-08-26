@@ -14,6 +14,7 @@ import tempfile
 from tqdm import tqdm
 from pathlib import Path
 from datetime import datetime
+from typing import NamedTuple
 import json
 import logging
 
@@ -30,41 +31,52 @@ TEMP_DIR = Path(tempfile.gettempdir()) / 'pygoogletakeoutdownloader'
 
 def refresh_download_token():
     """
-    Prompt for a manually recaptured curl.txt.
+    Refresh the session by walking the user through a manual DevTools
+    recapture, pasted directly into this prompt — nothing is written to
+    curl.txt, so no cookie jar is left sitting on disk between refreshes.
 
-    Google's automated sign-in detection rejects a Selenium-driven login
-    outright (the /v3/signin/rejected page) before it ever reaches a
-    password field, so there is no automated way to refresh the token.
-    Instead, pause and walk the user through capturing a fresh curl
-    command from their own logged-in browser.
+    Google's automated *sign-in* detection rejects a Selenium/Playwright-
+    driven browser outright (the /v3/signin/rejected page) before it ever
+    reaches a password field, so there's no automated way to do this step
+    — the human captures it themselves, in whatever browser they already
+    have the Takeout page open in.
 
-    :return: True once the user confirms curl.txt has been updated and it
-        exists; False if they abort (e.g. via EOF/Ctrl+C -> caught by caller)
+    :return: the AuthState parsed from what the user pastes; None if
+        refresh failed/was aborted (e.g. via EOF/Ctrl+C -> caught by
+        caller). Nothing is written to disk here — the captured cookies
+        live only in memory for the life of this process, applied
+        straight to the requests.Session (see main()'s apply_auth_state()
+        calls) instead of round-tripping through a curl.txt file, so
+        nothing session-sensitive is left behind once the run ends.
     """
-    curl_path = os.path.abspath('curl.txt')
-    print("\nYour Google Takeout download session is missing or stale.")
-    print("Google blocks automated (Selenium-driven) sign-in, so this has to")
-    print("be captured manually from a real, already-logged-in browser:")
-    print("  1. In Chrome/Chromium, make sure you're signed into the right")
-    print("     Google account, then go to:")
-    print("     https://takeout.google.com/settings/takeout")
-    print("  2. Click 'Download' (or wait for an existing export's Download link).")
-    print("  3. Open DevTools (F12) -> Network tab, find the request whose URL")
-    print("     starts with 'download?...' under takeout.google.com, right-click")
-    print("     it, and choose 'Copy' -> 'Copy as cURL'.")
-    print(f"  4. Paste it into {curl_path}, replacing the file's contents.")
-    try:
-        input("Press Enter once curl.txt has been updated (Ctrl+C to abort)... ")
-    except (EOFError, KeyboardInterrupt):
-        logging.error("Token refresh aborted before curl.txt was updated")
-        return False
+    print("\nPaste a fresh 'Copy as cURL' capture below "
+          "(blank line to submit, Ctrl+C to abort):")
 
-    if not os.path.exists('curl.txt'):
-        logging.error("curl.txt still not found after manual refresh prompt")
-        return False
+    while True:
+        lines = []
+        try:
+            while True:
+                line = input()
+                if line.strip() == '':
+                    break
+                lines.append(line)
+        except (EOFError, KeyboardInterrupt):
+            logging.error("Token refresh aborted before a curl command was entered")
+            return None
 
-    logging.info("Continuing with manually recaptured curl.txt")
-    return True
+        curl_text = '\n'.join(lines)
+        if not curl_text.strip():
+            print("Nothing entered — paste the curl command, or Ctrl+C to abort.")
+            continue
+
+        try:
+            auth = parse_curl(curl_text)
+        except ValueError as e:
+            print(f"Could not parse that as a Takeout curl command ({e}) — try again, or Ctrl+C to abort.")
+            continue
+
+        logging.info("Continuing with manually entered curl command")
+        return auth
 
 def create_url(index, job_id, rapt):
     """Create download URL with exact working format."""
@@ -73,6 +85,37 @@ def create_url(index, job_id, rapt):
             f"j={job_id}&"
             f"download=true&"
             f"rapt={rapt}")
+
+class AuthState(NamedTuple):
+    """
+    The four pieces of session state a download request needs — produced
+    by parse_curl() from either an on-disk curl.txt (initial bootstrap,
+    if one exists) or a curl command pasted directly into
+    refresh_download_token()'s prompt (every refresh after that).
+    """
+    headers: dict
+    cookies: dict
+    rapt: str
+    job_id: str
+
+RAPT_RE = re.compile(r'rapt=([^&\s\']+)')
+JOB_ID_RE = re.compile(r'[?&]j=([^&\s\']+)')
+
+def extract_rapt(text):
+    match = RAPT_RE.search(text)
+    if not match:
+        raise ValueError("No rapt token found")
+    return match.group(1)
+
+def extract_job_id(text):
+    # The job id (j=...) must come from the captured curl command, not a
+    # stale config value — it identifies which Takeout export this is and
+    # changes across exports/sessions. A wrong/missing job id produces a
+    # request Google's server rejects (seen in practice as a 500).
+    match = JOB_ID_RE.search(text)
+    if not match:
+        raise ValueError("No job id (j=...) found")
+    return match.group(1)
 
 def parse_curl(curl_text):
     """Extract auth info from curl command."""
@@ -92,19 +135,10 @@ def parse_curl(curl_text):
                 name, value = pair.split('=', 1)
                 cookies[name] = value
 
-    rapt_match = re.search(r'rapt=([^&\s\']+)', curl_text)
-    if not rapt_match:
-        raise ValueError("No rapt token found")
+    rapt = extract_rapt(curl_text)
+    job_id = extract_job_id(curl_text)
 
-    # The job id (j=...) must come from the captured curl command, not a
-    # stale config value — it identifies which Takeout export this is and
-    # changes across exports/sessions. A wrong/missing job id produces a
-    # request Google's server rejects (seen in practice as a 500).
-    job_id_match = re.search(r'[?&]j=([^&\s\']+)', curl_text)
-    if not job_id_match:
-        raise ValueError("No job id (j=...) found in curl command")
-
-    return headers, cookies, rapt_match.group(1), job_id_match.group(1)
+    return AuthState(headers, cookies, rapt, job_id)
 
 def describe_error_response(response, max_body_chars=500):
     """
@@ -219,6 +253,26 @@ def _safe_unlink(path):
     except OSError as e:
         logging.warning(f"Could not remove partial file {path}: {e}")
 
+def patch_config_field(config_path, section, key, value):
+    """
+    Read-modify-write a single config field on disk, instead of
+    overwriting the whole file from a possibly-stale in-memory snapshot.
+
+    A long-running download_takeout.py invocation holds its config dict
+    in memory for the whole run; if MoveWorker (or anything else) later
+    dumps that entire snapshot back to secrets.json, it silently reverts
+    any edit made to the file after the run started — e.g. a cdp_url
+    added mid-run, or a second invocation's own in-memory copy. Confirmed
+    in practice: MoveWorker used to do exactly that. Reading fresh from
+    disk immediately before the write keeps this narrow to the one field
+    each caller actually owns.
+    """
+    with open(config_path, 'r') as f:
+        on_disk = json.load(f)
+    on_disk.setdefault(section, {})[key] = value
+    with open(config_path, 'w') as f:
+        json.dump(on_disk, f, indent=4)
+
 class MoveWorker:
     """
     Background thread that moves verified downloads from TEMP_DIR into
@@ -231,9 +285,8 @@ class MoveWorker:
     leave a half-copied file at the destination.
     """
 
-    def __init__(self, config, config_path):
+    def __init__(self, config_path):
         self._queue = queue.Queue()
-        self._config = config
         self._config_path = config_path
         self._error = None
         self._thread = threading.Thread(target=self._run)
@@ -258,9 +311,7 @@ class MoveWorker:
                     # rename() can't cross that boundary, move() falls back
                     # to copy+delete.
                     shutil.move(str(tmpfile), str(outfile))
-                    self._config['authentication']['last_downloaded_index'] = index + 1
-                    with open(self._config_path, 'w') as f:
-                        json.dump(self._config, f, indent=4)
+                    patch_config_field(self._config_path, 'authentication', 'last_downloaded_index', index + 1)
                     logging.info(f"Moved file {index} to {outfile}")
                 except OSError as e:
                     logging.error(f"I/O error moving file {index} to {outfile}: {e}")
@@ -297,18 +348,28 @@ def describe_curl_age():
             "recapturing curl.txt now rather than waiting for a failure."
         )
 
+def apply_auth_state(session, auth):
+    """
+    Apply an AuthState's headers/cookies to `session` in place, regardless
+    of whether it came from an on-disk curl.txt or a pasted curl command.
+
+    :return: (rapt, job_id)
+    """
+    session.headers.update(auth.headers)
+    session.cookies.update(auth.cookies)
+    return auth.rapt, auth.job_id
+
 def load_curl_state(session):
     """
-    Read curl.txt, parse it, and apply its headers/cookies to `session`
-    in place.
+    Read curl.txt (the initial bootstrap file, if one exists — refreshes
+    no longer write one, see refresh_download_token()), parse it, and
+    apply it to `session`.
 
     :return: (rapt, job_id)
     """
     with open('curl.txt') as f:
-        headers, cookies, rapt, job_id = parse_curl(f.read())
-    session.headers.update(headers)
-    session.cookies.update(cookies)
-    return rapt, job_id
+        auth = parse_curl(f.read())
+    return apply_auth_state(session, auth)
 
 def main():
     # Configure logging
@@ -325,35 +386,33 @@ def main():
         logging.error("secrets.json not found")
         return 1
 
-    # Read curl command
-    if os.path.exists('curl.txt'):
-        # Only worth flagging for a pre-existing capture (e.g. resuming a
-        # run started earlier) — one just freshly written by
-        # refresh_download_token() below is obviously not stale.
-        describe_curl_age()
-    else:
-        logging.error("curl.txt not found. Attempting to retrieve new token.")
-        if not refresh_download_token():
-            logging.error("Failed to retrieve new download token")
-            return 1
-
     session = requests.Session()
     session.timeout = 30  # 30 second timeout
 
-    try:
-        rapt, job_id = load_curl_state(session)
-    except (ValueError, IOError) as e:
-        logging.error(f"Error parsing curl.txt: {e}")
-        if not refresh_download_token():
-            logging.error("Failed to retrieve new download token after parsing error")
-            return 1
-
-        # Retry parsing after token refresh
+    # curl.txt is only an optional initial-bootstrap convenience now —
+    # refresh_download_token() prompts for a pasted curl command directly
+    # and never writes one to disk (see its docstring for why).
+    if os.path.exists('curl.txt'):
+        # Only worth flagging for a pre-existing capture — one just
+        # produced by refresh_download_token() below is obviously not
+        # stale, and isn't written to a file to begin with.
+        describe_curl_age()
         try:
             rapt, job_id = load_curl_state(session)
-        except Exception as e:
-            logging.error(f"Persistent error parsing curl.txt: {e}")
+        except (ValueError, IOError) as e:
+            logging.error(f"Error parsing curl.txt: {e}")
+            auth = refresh_download_token()
+            if auth is None:
+                logging.error("Failed to retrieve new download token after parsing error")
+                return 1
+            rapt, job_id = apply_auth_state(session, auth)
+    else:
+        logging.info("curl.txt not found; prompting for an initial curl capture.")
+        auth = refresh_download_token()
+        if auth is None:
+            logging.error("Failed to retrieve new download token")
             return 1
+        rapt, job_id = apply_auth_state(session, auth)
 
     # Create output directory and local staging directory
     outdir = Path(config['google_takeout'].get('output_directory', '/mnt/f/GoogleTakeout'))
@@ -380,7 +439,7 @@ def main():
     # copy into output_directory overlaps with the next file's download
     # instead of blocking it. exit_code (rather than early `return`s) lets
     # every exit path still fall through to the `finally` that joins it.
-    move_worker = MoveWorker(config, 'secrets.json')
+    move_worker = MoveWorker('secrets.json')
     exit_code = 0
     i = start
     try:
@@ -410,37 +469,36 @@ def main():
                     break
 
                 if response.status_code != 200:
-                    description = describe_error_response(response)
-                    print(f"Error: {description}")
-                    logging.error(f"Download request failed: {description}")
+                    # Full response body (often a wall of Google's minified
+                    # JS/JSON page state) is rarely useful to a human here —
+                    # keep it at debug level only; the console gets a short,
+                    # actionable line instead.
+                    logging.debug(f"Download request failed: {describe_error_response(response)}")
+                    print(f"Download request failed (HTTP {response.status_code} {response.reason}) — refreshing session.")
+                    logging.error(f"Download request failed with HTTP {response.status_code}")
                     # Attempt to refresh token
-                    if not refresh_download_token():
+                    auth = refresh_download_token()
+                    if auth is None:
                         print("Failed to refresh download token")
                         exit_code = 1
                         break
-                    try:
-                        rapt, job_id = load_curl_state(session)
-                    except (ValueError, IOError) as e:
-                        print(f"Error parsing recaptured curl.txt: {e}")
-                        exit_code = 1
-                        break
+                    rapt, job_id = apply_auth_state(session, auth)
                     continue  # retry the SAME i with the refreshed token
 
                 if 'html' in response.headers.get('content-type', ''):
-                    description = describe_error_response(response)
-                    print(f"Error: Got HTML instead of file (auth failed). {description}")
-                    logging.error(f"Got HTML instead of file: {description}")
+                    # Same reasoning as above: this is Google's sign-in page
+                    # markup, not a useful diagnostic for a human — the
+                    # short message below already says everything actionable.
+                    logging.debug(f"Got HTML instead of file: {describe_error_response(response)}")
+                    print("Session expired (got a sign-in page instead of the file) — refreshing session.")
+                    logging.error("Got HTML instead of file (session expired)")
                     # Attempt to refresh token
-                    if not refresh_download_token():
+                    auth = refresh_download_token()
+                    if auth is None:
                         print("Failed to refresh download token")
                         exit_code = 1
                         break
-                    try:
-                        rapt, job_id = load_curl_state(session)
-                    except (ValueError, IOError) as e:
-                        print(f"Error parsing recaptured curl.txt: {e}")
-                        exit_code = 1
-                        break
+                    rapt, job_id = apply_auth_state(session, auth)
                     continue  # retry the SAME i with the refreshed token
 
                 # outfile's name carries the download timestamp for
