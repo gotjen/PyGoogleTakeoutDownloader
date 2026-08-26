@@ -121,6 +121,25 @@ def describe_error_response(response, max_body_chars=500):
         f"  Body: {snippet or '<empty>'}"
     )
 
+OUTFILE_INDEX_RE = re.compile(r'-(\d{3})\.zip$')
+
+def scan_completed_indices(outdir):
+    """
+    Return the set of file indices already present in outdir, parsed from
+    filenames matching outfile's `...-{index:03d}.zip` naming scheme.
+
+    Used to detect gaps in the numbered series — e.g. a file a past bug
+    silently skipped, or one manually removed — so a resume can find exactly
+    what's missing instead of trusting last_downloaded_index alone, which
+    has already been observed to advance past a skipped file.
+    """
+    indices = set()
+    for path in outdir.glob('*.zip'):
+        m = OUTFILE_INDEX_RE.search(path.name)
+        if m:
+            indices.add(int(m.group(1)))
+    return indices
+
 def check_disk_space(path, required_bytes, label):
     """
     Verify at least `required_bytes` is free on the filesystem backing `path`.
@@ -298,11 +317,19 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Find last downloaded file
-    start = config['authentication'].get('last_downloaded_index', 0)
+    # Resume point comes entirely from what's actually in outdir, not from
+    # last_downloaded_index: a past bug demonstrated that counter can
+    # advance past a file that was silently skipped, permanently hiding the
+    # gap from every future run if trusted as the sole source of truth.
+    # Simplest fix: always start at 0 and let the per-index check below
+    # skip whatever's already present — no separate "first gap" bookkeeping
+    # to keep in sync.
+    existing_indices = scan_completed_indices(outdir)
+    start = 0
     max_files = config['google_takeout'].get('max_files', 277)
 
-    print(f"Starting from index {start}")
+    print(f"Found {len(existing_indices)} existing file(s) in {outdir}; "
+          f"filling in whatever's missing up to index {max_files - 1}.")
 
     download_delay = config['google_takeout'].get('download_delay', 5)
 
@@ -312,12 +339,21 @@ def main():
     # every exit path still fall through to the `finally` that joins it.
     move_worker = MoveWorker(config, 'secrets.json')
     exit_code = 0
+    i = start
     try:
-        for i in range(start, max_files):
+        while i < max_files:
             worker_error = move_worker.error()
             if worker_error:
                 exit_code = 1
                 break
+
+            if i in existing_indices:
+                # A gap-fill pass can walk back into indices already
+                # present past the first gap (e.g. resuming into 6 when 7+
+                # already exist) — skip straight through without a request.
+                print(f"File {i} already present in {outdir}, skipping")
+                i += 1
+                continue
 
             print(f"\nDownloading file {i}...")
 
@@ -345,7 +381,7 @@ def main():
                         print(f"Error parsing recaptured curl.txt: {e}")
                         exit_code = 1
                         break
-                    continue
+                    continue  # retry the SAME i with the refreshed token
 
                 if 'html' in response.headers.get('content-type', ''):
                     description = describe_error_response(response)
@@ -362,7 +398,7 @@ def main():
                         print(f"Error parsing recaptured curl.txt: {e}")
                         exit_code = 1
                         break
-                    continue
+                    continue  # retry the SAME i with the refreshed token
 
                 # outfile's name carries the download timestamp for
                 # traceability; tmpfile's name is stable (index-only) so a
@@ -440,6 +476,12 @@ def main():
 
             print(f"Waiting {download_delay} seconds...")
             time.sleep(download_delay)
+            # Only reached after a real success — every retry/refresh path
+            # above hits `continue` before this, and every fatal path hits
+            # `break`. This is what makes retrying file i (rather than
+            # silently skipping to i+1, as the old `for i in range(...)`
+            # loop did on a token-refresh `continue`) actually work.
+            i += 1
     except KeyboardInterrupt:
         # A clean pause, not a crash: last_downloaded_index only ever
         # reflects fully-moved files (MoveWorker updates it), so re-running
